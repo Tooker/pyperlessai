@@ -11,4 +11,5 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "openai",
     "ruff>=0.12.9",
+    "pyyaml>=6.0.2",
 ]
