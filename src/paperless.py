@@ -128,3 +128,105 @@ class PaperlessClient:
                 await created_client.aclose()
 
         return None
+
+
+    async def _fetch_list(
+        self,
+        client: Optional[httpx.AsyncClient],
+        endpoints: List[str],
+        page_size: int = 500,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Generic helper to fetch paginated lists from one of multiple possible endpoints.
+        Tries each endpoint in order until it finds one that returns results.
+        """
+        created_client = None
+        if client is None:
+            created_client = httpx.AsyncClient(headers=self.headers, timeout=self.timeout)
+            client = created_client
+
+        try:
+            for ep in endpoints:
+                items: List[Dict[str, Any]] = []
+                next_url = f"{self.base_url}/api/{ep}/?page_size={page_size}"
+                try:
+                    while next_url:
+                        next_url = next_url.replace("http://","https://")
+                        logger.info(f"Fetching {ep} page: {next_url}")
+                        resp = await client.get(next_url)
+                        # If endpoint not found, try the next candidate
+                        if resp.status_code == 404:
+                            logger.debug(f"Endpoint /api/{ep}/ returned 404, trying next endpoint")
+                            items = []
+                            break
+
+                        resp.raise_for_status()
+                        data = resp.json()
+                        page_results = data.get("results") or data.get("data") or data
+                        if isinstance(page_results, list):
+                            items.extend(page_results)
+                        elif isinstance(page_results, dict):
+                            items.append(page_results)
+                        else:
+                            logger.warning(f"Unexpected response shape for /api/{ep}/: {type(page_results)}")
+
+                        if limit and len(items) >= limit:
+                            return items[:limit]
+
+                        next_url = data.get("next")
+                except httpx.HTTPStatusError as e:
+                    logger.warning(f"HTTP error when fetching /api/{ep}/: {e}")
+                    items = []
+                except Exception as e:
+                    logger.warning(f"Error when fetching /api/{ep}/: {e}")
+                    items = []
+
+                if items:
+                    return items[:limit] if limit else items
+
+            # If none of the endpoints returned data, return empty list
+            return []
+        finally:
+            if created_client:
+                await created_client.aclose()
+
+
+    async def list_tags(
+        self,
+        client: Optional[httpx.AsyncClient] = None,
+        page_size: int = 100,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return a list of tag objects from the paperless API.
+        Tries common tag endpoint paths.
+        """
+        endpoints = ["tags"]
+        return await self._fetch_list(client, endpoints, page_size=page_size, limit=limit)
+
+
+    async def list_document_types(
+        self,
+        client: Optional[httpx.AsyncClient] = None,
+        page_size: int = 100,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return a list of document type objects. Tries several common endpoint name variants.
+        """
+        endpoints = ["document_types"]
+        return await self._fetch_list(client, endpoints, page_size=page_size, limit=limit)
+
+
+    async def list_correspondents(
+        self,
+        client: Optional[httpx.AsyncClient] = None,
+        page_size: int = 100,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return a list of correspondent/contact objects. Tries a few possible endpoint names.
+        """
+        endpoints = ["correspondents", "correspondent", "contacts"]
+        return await self._fetch_list(client, endpoints, page_size=page_size, limit=limit)

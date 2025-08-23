@@ -15,6 +15,7 @@ import io
 from loguru import logger
 from dotenv import load_dotenv
 import yaml
+import json
 from typing import Optional, Dict, Any
 
 # Load environment variables from a local .env file (if present)
@@ -136,7 +137,7 @@ async def process_document(
             logger.exception("Failed to call OpenAI for doc %s: %s", doc_id, e)
 
 
-async def main(limit: int = 10, page_size: int = 100):
+async def main(limit: int = 10, page_size: int = 500):
     paperless = PaperlessClient(base_url=PAPERLESS_BASE_URL, api_token=PAPERLESS_API_TOKEN, request_timeout=REQUEST_TIMEOUT)
     ai = AIClient(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, request_timeout=120)
 
@@ -149,6 +150,35 @@ async def main(limit: int = 10, page_size: int = 100):
         async with httpx.AsyncClient(headers=headers, timeout=timeout) as http_client:
             docs = await paperless.list_documents(http_client, page_size=page_size, limit=limit)
             logger.info(f"Found {len(docs)} documents (requested limit={limit})")
+
+            # Also fetch auxiliary interfaces: tags, document types, correspondents
+            out_dir = "poc_output"
+            os.makedirs(out_dir, exist_ok=True)
+
+            try:
+                tags = await paperless.list_tags(http_client)
+                with open(os.path.join(out_dir, "tags.json"), "w", encoding="utf-8") as jf:
+                    json.dump(tags, jf, ensure_ascii=False, indent=2)
+                logger.info(f"Saved {len(tags)} tags to {os.path.join(out_dir, 'tags.json')}")
+            except Exception as e:
+                logger.exception("Failed to fetch/save tags: %s", e)
+
+            try:
+                document_types = await paperless.list_document_types(http_client)
+                with open(os.path.join(out_dir, "document_types.json"), "w", encoding="utf-8") as jf:
+                    json.dump(document_types, jf, ensure_ascii=False, indent=2)
+                logger.info(f"Saved {len(document_types)} document types to {os.path.join(out_dir, 'document_types.json')}")
+            except Exception as e:
+                logger.exception("Failed to fetch/save document types: %s", e)
+
+            try:
+                correspondents = await paperless.list_correspondents(http_client)
+                with open(os.path.join(out_dir, "correspondents.json"), "w", encoding="utf-8") as jf:
+                    json.dump(correspondents, jf, ensure_ascii=False, indent=2)
+                logger.info(f"Saved {len(correspondents)} correspondents to {os.path.join(out_dir, 'correspondents.json')}")
+            except Exception as e:
+                logger.exception("Failed to fetch/save correspondents: %s", e)
+
             semaphore = asyncio.Semaphore(CONCURRENT_WORKERS)
             tasks = []
             for doc in docs:
@@ -164,7 +194,7 @@ if __name__ == "__main__":
         "--limit", type=int, default=10, help="Maximum number of documents to process"
     )
     parser.add_argument(
-        "--page_size", type=int, default=100, help="Page size when listing documents"
+        "--page_size", type=int, default=500, help="Page size when listing documents"
     )
     args = parser.parse_args()
     try:
