@@ -32,7 +32,19 @@ from dotenv import load_dotenv
 
 # Load environment variables from a local .env file (if present)
 load_dotenv()
+import yaml
 from typing import Optional, List, Dict
+
+# Load settings.yaml from project root (optional). If not found, fall back to defaults.
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.yaml")
+try:
+    with open(SETTINGS_FILE, "r", encoding="utf-8") as sf:
+        _settings = yaml.safe_load(sf) or {}
+except FileNotFoundError:
+    _settings = {}
+# Extract prompt (multi-line string) or None
+SETTINGS_PROMPT = _settings.get("prompt")
 
 import httpx
 from PIL import Image
@@ -81,7 +93,7 @@ except Exception:
     pass
 
 
-def u(img_bytes: bytes, max_size: int = MAX_IMAGE_SIZE) -> bytes:
+def normalize_image_bytes(img_bytes: bytes, max_size: int = MAX_IMAGE_SIZE) -> bytes:
     """Open bytes with Pillow, convert to RGB, resize (keeping aspect) and return JPEG bytes."""
     with Image.open(io.BytesIO(img_bytes)) as img:
         img = img.convert("RGB")
@@ -174,8 +186,8 @@ async def send_image_to_openai(client: httpx.AsyncClient, img_bytes: bytes) -> D
     """
     b64 = base64.b64encode(img_bytes).decode("ascii")
     data_url = f"data:image/jpeg;base64,{b64}"
-    # Simple prompt asking for OCR + labels
-    prompt_text = "Please extract any text (OCR) and list relevant labels and a short caption describing the image."
+    # Prompt: use settings.yaml prompt if present, otherwise fallback to a sensible default.
+    prompt_text = SETTINGS_PROMPT or "Please extract any text (OCR) and list relevant labels and a short caption describing the image."
     payload = {
         "model": OPENAI_MODEL,
         # "input" supports arrays of multimodal blocks for some OpenAI endpoints
@@ -293,15 +305,14 @@ async def send_pdf_to_openai(pdf_bytes: bytes, prompt_text: str) -> Dict:
                         "role": "user",
                         "content": [
                             {"type": "input_text", "text": prompt_text},
-                            {
-                                "type": "input_file",
-                                "file_id": file_id
-                            },
+                            {"type": "input_file", "file_id": file_id},
                         ],
                     }
                 ],
+                reasoning={"effort": "minimal"},
             )
             return response
+
         response = await asyncio.to_thread(_create_response)
         return response
     finally:
@@ -357,7 +368,7 @@ async def process_document(
             logger.info(
                 f"Downloaded content is PDF for doc {doc_id} — uploading to OpenAI"
             )
-            prompt_text = "Please extract any text (OCR) and list relevant labels and a short caption describing the document."
+            prompt_text = SETTINGS_PROMPT or "Please extract any text (OCR) and list relevant labels and a short caption describing the document."
             try:
                 result = await send_pdf_to_openai(thumbnail, prompt_text)
                 # Convert SDK object to serializable dict if possible
