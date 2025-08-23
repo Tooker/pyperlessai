@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any
 import httpx
 from loguru import logger
 from PIL import Image
+from schemas import DocumentMetadata
 
 # Import openai module for SDK upload fallback in send_pdf_bytes
 import openai
@@ -133,7 +134,7 @@ class AIClient:
                 # Try multiple ways depending on SDK
                 response = None
                 if hasattr(client, "responses") and hasattr(client.responses, "create"):
-                    response = client.responses.create(
+                    response = client.responses.parse(
                         model=self.model,
                         input=[
                             {
@@ -144,7 +145,8 @@ class AIClient:
                                 ],
                             }
                         ],
-                        reasoning={"effort": "minimal"},
+                        reasoning={"effort": "low"},
+                        text_format=DocumentMetadata
                     )
                 elif hasattr(client, "completions") and hasattr(client.completions, "create"):
                     # fallback older API shapes (unlikely but defensive)

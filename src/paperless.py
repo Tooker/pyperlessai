@@ -228,5 +228,68 @@ class PaperlessClient:
         """
         Return a list of correspondent/contact objects. Tries a few possible endpoint names.
         """
-        endpoints = ["correspondents", "correspondent", "contacts"]
+        endpoints = ["correspondents"]
         return await self._fetch_list(client, endpoints, page_size=page_size, limit=limit)
+
+
+    # Utilities to produce simplified id -> name maps and pretty-printed representations
+    def _name_map_from_items(self, items: List[Dict[str, Any]]) -> Dict[int, str]:
+        """
+        Build a mapping of item id -> item name from a list of dict-like items.
+        Skips items that do not contain both 'id' and 'name'.
+        """
+        result: Dict[int, str] = {}
+        for item in items:
+            try:
+                if "id" in item and "name" in item:
+                    result[int(item["id"])] = item.get("name", "")
+            except Exception:
+                # Ignore malformed items
+                continue
+        return result
+
+    def _pretty_from_map(self, m: Dict[int, str]) -> str:
+        """
+        Return a stable, newline-separated pretty string for a mapping of id -> name.
+        Sorted by id for determinism.
+        """
+        return "\n".join(f"{k}: {v}" for k, v in sorted(m.items()))
+
+    async def tags_name_map(self, client: Optional[httpx.AsyncClient] = None) -> Dict[int, str]:
+        """
+        Return a simplified mapping of tag id -> tag name.
+        """
+        items = await self.list_tags(client=client)
+        return self._name_map_from_items(items)
+
+    async def tags_pretty(self, client: Optional[httpx.AsyncClient] = None) -> str:
+        """
+        Return a pretty-printed string of tag id -> name pairs (one per line).
+        """
+        return self._pretty_from_map(await self.tags_name_map(client=client))
+
+    async def document_types_name_map(self, client: Optional[httpx.AsyncClient] = None) -> Dict[int, str]:
+        """
+        Return a simplified mapping of document type id -> document type name.
+        """
+        items = await self.list_document_types(client=client)
+        return self._name_map_from_items(items)
+
+    async def document_types_pretty(self, client: Optional[httpx.AsyncClient] = None) -> str:
+        """
+        Return a pretty-printed string of document type id -> name pairs (one per line).
+        """
+        return self._pretty_from_map(await self.document_types_name_map(client=client))
+
+    async def correspondents_name_map(self, client: Optional[httpx.AsyncClient] = None) -> Dict[int, str]:
+        """
+        Return a simplified mapping of correspondent id -> correspondent name.
+        """
+        items = await self.list_correspondents(client=client)
+        return self._name_map_from_items(items)
+
+    async def correspondents_pretty(self, client: Optional[httpx.AsyncClient] = None) -> str:
+        """
+        Return a pretty-printed string of correspondent id -> name pairs (one per line).
+        """
+        return self._pretty_from_map(await self.correspondents_name_map(client=client))

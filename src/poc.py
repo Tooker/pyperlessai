@@ -62,12 +62,14 @@ if not OPENAI_API_KEY:
 # Import refactored clients
 from paperless import PaperlessClient
 from ai_client import AIClient
+from classifier import PaperlessOpenAIClassifier
 
 
 async def process_document(
     semaphore: asyncio.Semaphore,
     paperless: PaperlessClient,
     ai: AIClient,
+    classifier: PaperlessOpenAIClassifier,
     http_client,
     doc: Dict[str, Any],
     max_image_size: int,
@@ -81,6 +83,7 @@ async def process_document(
             logger.warning(f"No id found on document: {doc}")
             return
 
+        # Fetch raw bytes once (we'll reuse for saving/analysis)
         content = await paperless.fetch_document_bytes(http_client, doc_id)
         if not content:
             logger.warning(f"No thumbnail/download available for doc {doc_id}")
@@ -88,12 +91,11 @@ async def process_document(
 
         os.makedirs(out_dir, exist_ok=True)
 
-        # If PDF, upload PDF to OpenAI
+        # If PDF, analyze via classifier (uses grounded prompt)
         if content.startswith(b"%PDF"):
-            logger.info(f"Downloaded content is PDF for doc {doc_id} — uploading to OpenAI")
-            prompt_text = SETTINGS_PROMPT or "Please extract any text (OCR) and list relevant labels and a short caption describing the document."
+            logger.info(f"Downloaded content is PDF for doc {doc_id} — analyzing with classifier")
             try:
-                result = await ai.send_pdf_bytes(content, prompt_text)
+                result = await classifier.analyze_pdf(content)
                 # Convert SDK object to serializable dict if possible
                 try:
                     if hasattr(result, "to_dict"):
@@ -104,25 +106,29 @@ async def process_document(
                         result_obj = {"raw": str(result)}
                 except Exception:
                     result_obj = {"raw": str(result)}
-
+                print(result_obj)
                 json_out = os.path.join(out_dir, f"{doc_id}.openai.json")
+                json_parsed_out = os.path.join(out_dir, f"{doc_id}.openai_parsed.json")
                 import json
 
                 with open(json_out, "w", encoding="utf-8") as jf:
-                    json.dump(result_obj, jf, ensure_ascii=False, indent=2)
+                    jf.write(result.model_dump_json(indent=2))
+                with open(json_parsed_out,"w", encoding="utf-8") as parsed:
+                    parsed.write(result.output_parsed.model_dump_json(indent=2))
+                
                 logger.info(f"Saved OpenAI JSON result to {json_out}")
             except Exception as e:
                 logger.exception("Failed to call OpenAI for PDF doc %s: %s", doc_id, e)
             return
 
-        # Otherwise normalize image and send to OpenAI
+        # Otherwise normalize image and send to OpenAI using classifier's prompt
         norm = AIClient.normalize_image_bytes(content, max_size=max_image_size)
         out_path = os.path.join(out_dir, f"{doc_id}.jpg")
         with open(out_path, "wb") as f:
             f.write(norm)
         logger.info(f"Saved normalized image to {out_path}")
 
-        prompt_text = SETTINGS_PROMPT or "Please extract any text (OCR) and list relevant labels and a short caption describing the image."
+        prompt_text = SETTINGS_PROMPT or classifier.build_prompt()
         try:
             result = await ai.send_image_bytes(http_client, norm, prompt_text)
             # Save full JSON for inspection
@@ -131,6 +137,7 @@ async def process_document(
 
             with open(json_out, "w", encoding="utf-8") as jf:
                 json.dump(result, jf, ensure_ascii=False, indent=2)
+            
             logger.info(f"Saved OpenAI JSON result to {json_out}")
             logger.info(f"OpenAI result for doc {doc_id}: {str(result)[:1000]}")
         except Exception as e:
@@ -156,7 +163,7 @@ async def main(limit: int = 10, page_size: int = 500):
             os.makedirs(out_dir, exist_ok=True)
 
             try:
-                tags = await paperless.list_tags(http_client)
+                tags = await paperless.tags_name_map(http_client)
                 with open(os.path.join(out_dir, "tags.json"), "w", encoding="utf-8") as jf:
                     json.dump(tags, jf, ensure_ascii=False, indent=2)
                 logger.info(f"Saved {len(tags)} tags to {os.path.join(out_dir, 'tags.json')}")
@@ -179,10 +186,14 @@ async def main(limit: int = 10, page_size: int = 500):
             except Exception as e:
                 logger.exception("Failed to fetch/save correspondents: %s", e)
 
+            # Create classifier (prefetches paperless entities). Wait for prefetch to finish.
+            classifier = PaperlessOpenAIClassifier(paperless, ai, http_client=http_client, base_prompt=SETTINGS_PROMPT)
+            await classifier.ensure_prefetched()
+
             semaphore = asyncio.Semaphore(CONCURRENT_WORKERS)
             tasks = []
             for doc in docs:
-                tasks.append(process_document(semaphore, paperless, ai, http_client, doc, MAX_IMAGE_SIZE))
+                tasks.append(process_document(semaphore, paperless, ai, classifier, http_client, doc, MAX_IMAGE_SIZE))
             await asyncio.gather(*tasks)
     except Exception as e:
         logger.exception("Unexpected error in main: %s", e)
@@ -191,7 +202,7 @@ async def main(limit: int = 10, page_size: int = 500):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PoC: Fetch paperless-ngx thumbnails -> OpenAI (refactored)")
     parser.add_argument(
-        "--limit", type=int, default=10, help="Maximum number of documents to process"
+        "--limit", type=int, default=1, help="Maximum number of documents to process"
     )
     parser.add_argument(
         "--page_size", type=int, default=500, help="Page size when listing documents"
