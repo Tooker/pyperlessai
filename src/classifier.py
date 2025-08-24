@@ -10,6 +10,7 @@ from loguru import logger
 
 from paperless import PaperlessClient
 from ai_client import AIClient
+from schemas import DocumentMetadata
 
 
 class PaperlessOpenAIClassifier:
@@ -86,37 +87,17 @@ class PaperlessOpenAIClassifier:
         """
         logger.info("Fetching tags, document types, and correspondents from Paperless...")
         try:
-            try:
-                self.tags_map = await self.paperless.tags_name_map()
-            except Exception as e:
-                logger.exception("Failed to fetch tags: %s", e)
-                self.tags_map = {}
+            # Delegate error handling to PaperlessClient; its name-map helpers
+            # will return empty dicts and log failures. Keep a top-level catch
+            # for any unexpected errors during prefetch.
+            self.tags_map = await self.paperless.tags_name_map()
+            self.document_types_map = await self.paperless.document_types_name_map()
+            self.correspondents_map = await self.paperless.correspondents_name_map()
 
-            try:
-                self.document_types_map = await self.paperless.document_types_name_map()
-            except Exception as e:
-                logger.exception("Failed to fetch document types: %s", e)
-                self.document_types_map = {}
 
-            try:
-                self.correspondents_map = await self.paperless.correspondents_name_map()
-            except Exception as e:
-                logger.exception("Failed to fetch correspondents: %s", e)
-                self.correspondents_map = {}
-
-            # Ensure deterministic ordering
-            self.tags_map = dict(sorted(self.tags_map.items()))
-            self.document_types_map = dict(sorted(self.document_types_map.items()))
-            self.correspondents_map = dict(sorted(self.correspondents_map.items()))
-
-            logger.info(
-                "Prefetch complete: %d tags, %d document types, %d correspondents",
-                len(self.tags_map),
-                len(self.document_types_map),
-                len(self.correspondents_map),
-            )
+            logger.info(f"Prefetch complete: {len(self.tags_map)} tags, {len(self.document_types_map)} document types, {len(self.correspondents_map)} correspondents")
         except Exception as e:
-            logger.exception("Unexpected error during prefetch: %s", e)
+            logger.exception(f"Unexpected error during prefetch: {e}")
 
     async def ensure_prefetched(self) -> None:
         """
@@ -192,7 +173,7 @@ class PaperlessOpenAIClassifier:
             template_path = Path(__file__).resolve().parents[1] / "prompts" / "paperless_prompt.md"
             template = template_path.read_text(encoding="utf-8")
         except Exception as e:
-            logger.exception("Failed to read prompt template, falling back to inlined prompt: %s", e)
+            logger.exception(f"Failed to read prompt template, falling back to inlined prompt: {e}")
             # Minimal fallback if the external template cannot be read
             template = self.base_prompt
 
@@ -215,15 +196,163 @@ class PaperlessOpenAIClassifier:
 
         return prompt_text
 
-    async def analyze_pdf(self, pdf_bytes: bytes, extra_instructions: Optional[str] = None) -> AnyType:
+    async def analyze_pdf(
+        self,
+        pdf_bytes: bytes,
+        extra_instructions: Optional[str] = None,
+        paperless_doc_id: Optional[int] = None,
+    ) -> AnyType:
         """
         Send the provided PDF to OpenAI using AIClient, with a prompt that
         includes grounded context (tags, correspondents, document types).
+
+        After receiving a structured response from the AI (DocumentMetadata),
+        ensure Paperless contains the referenced correspondent, tags and document_type,
+        creating any missing entities. If paperless_doc_id is provided, patch the
+        Paperless document to set the correspondent, tags, document_type, title and document_date.
+
         Returns the raw response from AIClient.send_pdf_bytes (SDK object or dict).
         """
         prompt_text = self.build_prompt(extra_instructions=extra_instructions)
         logger.info("Sending PDF to OpenAI with grounded context (tags, correspondents, document types).")
-        return await self.ai.send_pdf_bytes(pdf_bytes, prompt_text)
+        result = await self.ai.send_pdf_bytes(pdf_bytes, prompt_text)
+
+        # Attempt to extract parsed output that matches DocumentMetadata
+        parsed_obj = None
+        try:
+            # Common SDK/dict locations
+            if hasattr(result, "output_parsed"):
+                parsed_obj = getattr(result, "output_parsed")
+            elif isinstance(result, dict) and "output_parsed" in result:
+                parsed_obj = result["output_parsed"]
+        except Exception:
+            parsed_obj = None
+
+        # If we found something that looks like parsed output, try to coerce into the Pydantic model.
+        metadata: Optional[DocumentMetadata] = None
+        if parsed_obj is not None:
+            try:
+                # If parsed_obj is a JSON/string, try to load it
+                if isinstance(parsed_obj, str):
+                    try:
+                        parsed_dict = json.loads(parsed_obj)
+                    except Exception:
+                        parsed_dict = None
+                elif isinstance(parsed_obj, dict):
+                    parsed_dict = parsed_obj
+                else:
+                    # Fallback: try to call model_dump or convert to dict
+                    try:
+                        parsed_dict = parsed_obj.model_dump()  # type: ignore[attr-defined]
+                    except Exception:
+                        parsed_dict = None
+
+                if parsed_dict is not None:
+                    metadata = DocumentMetadata.model_validate(parsed_dict)
+            except Exception as e:
+                logger.warning(f"Failed to parse AI output into DocumentMetadata: {e}")
+                metadata = None
+
+        # If we didn't get structured metadata, nothing more to do — return raw result.
+        if metadata is None:
+            logger.info("No structured metadata found in AI response; returning raw result.")
+            return result
+
+        # Ensure we have the latest name maps
+        await self.ensure_prefetched()
+
+        # Helper: case-insensitive lookup in a name map -> returns id or None
+        def _find_id_by_name(mapping: Dict[int, str], name: Optional[str]) -> Optional[int]:
+            if not name:
+                return None
+            target = name.strip().casefold()
+            for k, v in mapping.items():
+                if v and v.strip().casefold() == target:
+                    return k
+            return None
+
+        created_entities: Dict[str, Any] = {"tags": [], "correspondent": None, "document_type": None}
+
+        # Correspondent: find or create
+        correspondent_id = _find_id_by_name(self.correspondents_map, metadata.correspondent)
+        if correspondent_id is None and metadata.correspondent:
+            try:
+                created = await self.paperless.create_correspondent(metadata.correspondent)
+                if created and "id" in created:
+                    correspondent_id = int(created["id"])
+                    # update local map
+                    self.correspondents_map[correspondent_id] = created.get("name", metadata.correspondent)
+                    created_entities["correspondent"] = {"id": correspondent_id, "name": self.correspondents_map[correspondent_id]}
+                    logger.info(f"Created new correspondent: {created_entities['correspondent']['name']} (id={correspondent_id})")
+            except Exception as e:
+                logger.warning(f"Failed to create correspondent '{metadata.correspondent}': {e}")
+
+        # Tags: up to 3
+        tag_ids: List[int] = []
+        for tag_name in metadata.tags or []:
+            if not tag_name:
+                continue
+            tid = _find_id_by_name(self.tags_map, tag_name)
+            if tid is None:
+                try:
+                    created = await self.paperless.create_tag(tag_name)
+                    if created and "id" in created:
+                        tid = int(created["id"])
+                        self.tags_map[tid] = created.get("name", tag_name)
+                        created_entities["tags"].append({"id": tid, "name": self.tags_map[tid]})
+                        logger.info(f"Created new tag: {self.tags_map[tid]} (id={tid})")
+                except Exception as e:
+                    logger.warning(f"Failed to create tag '{tag_name}': {e}")
+                    continue
+            if tid is not None:
+                tag_ids.append(tid)
+
+        # Document type: find or create
+        document_type_id = _find_id_by_name(self.document_types_map, metadata.document_type)
+        if document_type_id is None and metadata.document_type:
+            try:
+                created = await self.paperless.create_document_type(metadata.document_type)
+                if created and "id" in created:
+                    document_type_id = int(created["id"])
+                    self.document_types_map[document_type_id] = created.get("name", metadata.document_type)
+                    created_entities["document_type"] = {"id": document_type_id, "name": self.document_types_map[document_type_id]}
+                    logger.info(f"Created new document_type: {created_entities['document_type']['name']} (id={document_type_id})")
+            except Exception as e:
+                logger.warning(f"Failed to create document_type '{metadata.document_type}': {e}")
+
+        # If a Paperless document id was provided, update the document
+        if paperless_doc_id is not None:
+            payload: Dict[str, Any] = {}
+            if metadata.title:
+                payload["title"] = metadata.title
+            if correspondent_id is not None:
+                payload["correspondent"] = correspondent_id
+            if tag_ids:
+                payload["tags"] = tag_ids
+            if document_type_id is not None:
+                payload["document_type"] = document_type_id
+            if metadata.document_date:
+                # pydantic parsed this as date
+                try:
+                    payload["document_date"] = metadata.document_date.isoformat()  # type: ignore[attr-defined]
+                except Exception:
+                    payload["document_date"] = str(metadata.document_date)
+
+            if payload:
+                try:
+                    updated = await self.paperless.update_document(paperless_doc_id, payload)
+                    if updated:
+                        logger.info(f"Updated Paperless document id={paperless_doc_id} with payload={payload}")
+                    else:
+                        logger.warning(f"Paperless update returned no result for id={paperless_doc_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to update Paperless document id={paperless_doc_id}: {e}")
+
+        # Log created entities for debugging
+        if created_entities["correspondent"] or created_entities["tags"] or created_entities["document_type"]:
+            logger.info(f"Created entities during analyze_pdf: {created_entities}")
+
+        return result
 
     async def analyze_paperless_document(
         self,
@@ -246,7 +375,7 @@ class PaperlessOpenAIClassifier:
             raise ValueError(f"No content returned for Paperless document id={doc_id}")
 
         if content.startswith(b"%PDF"):
-            return await self.analyze_pdf(content, extra_instructions=extra_instructions)
+            return await self.analyze_pdf(content, extra_instructions=extra_instructions, paperless_doc_id=doc_id)
 
         # For non-PDF content, use AI client's vision endpoint (if available)
         logger.info("Sending image bytes to AI vision endpoint.")
@@ -312,7 +441,7 @@ class PaperlessOpenAIClassifier:
 
                 logger.info(f"Saved OpenAI JSON result to {json_out}")
             except Exception as e:
-                logger.exception("Failed to call classifier for doc %s: %s", doc_id, e)
+                logger.exception(f"Failed to call classifier for doc {doc_id}: {e}")
             return
 
     async def run(

@@ -296,8 +296,14 @@ class PaperlessClient:
         """
         Return a simplified mapping of tag id -> tag name.
         """
-        items = await self.list_tags(client=client)
-        return self._name_map_from_items(items)
+        try:
+            items = await self.list_tags(client=client)
+            result = self._name_map_from_items(items)
+            # Ensure deterministic ordering by id
+            return dict(sorted(result.items()))
+        except Exception as e:
+            logger.exception("Failed to fetch tags: %s", e)
+            return {}
 
     async def tags_pretty(self, client: Optional[httpx.AsyncClient] = None) -> str:
         """
@@ -309,8 +315,14 @@ class PaperlessClient:
         """
         Return a simplified mapping of document type id -> document type name.
         """
-        items = await self.list_document_types(client=client)
-        return self._name_map_from_items(items)
+        try:
+            items = await self.list_document_types(client=client)
+            result = self._name_map_from_items(items)
+            # Ensure deterministic ordering by id
+            return dict(sorted(result.items()))
+        except Exception as e:
+            logger.exception("Failed to fetch document types: %s", e)
+            return {}
 
     async def document_types_pretty(self, client: Optional[httpx.AsyncClient] = None) -> str:
         """
@@ -322,8 +334,14 @@ class PaperlessClient:
         """
         Return a simplified mapping of correspondent id -> correspondent name.
         """
-        items = await self.list_correspondents(client=client)
-        return self._name_map_from_items(items)
+        try:
+            items = await self.list_correspondents(client=client)
+            result = self._name_map_from_items(items)
+            # Ensure deterministic ordering by id
+            return dict(sorted(result.items()))
+        except Exception as e:
+            logger.exception("Failed to fetch correspondents: %s", e)
+            return {}
 
     async def correspondents_pretty(self, client: Optional[httpx.AsyncClient] = None) -> str:
         """
