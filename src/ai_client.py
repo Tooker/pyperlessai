@@ -43,6 +43,33 @@ class AIClient:
             img.save(out, format="JPEG", quality=85)
             return out.getvalue()
 
+    @staticmethod
+    def _image_bytes_to_data_url(img_bytes: bytes) -> str:
+        """
+        Build a base64 data URL for the provided image bytes.
+
+        Attempts to detect the image format via Pillow and sets an appropriate
+        MIME type (e.g. image/png, image/jpeg). Falls back to image/jpeg if
+        detection fails or the format is uncommon. The data URL uses the raw
+        bytes supplied (no conversion) so callers may pass normalized JPEG bytes
+        when desired.
+        """
+        try:
+            with Image.open(io.BytesIO(img_bytes)) as img:
+                fmt = (img.format or "").lower()
+        except Exception:
+            fmt = ""
+
+        if fmt in ("jpeg", "jpg"):
+            mime = "image/jpeg"
+        elif fmt in ("png", "gif", "webp", "bmp", "tiff", "avif"):
+            mime = f"image/{fmt}"
+        else:
+            mime = "image/jpeg"
+
+        b64 = base64.b64encode(img_bytes).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+
     async def send_image_bytes(
         self,
         http_client: httpx.AsyncClient,
@@ -54,8 +81,9 @@ class AIClient:
         Uses an externally provided httpx.AsyncClient (so the caller can control headers/timeouts).
         Returns the parsed JSON response.
         """
-        b64 = base64.b64encode(img_bytes).decode("ascii")
-        data_url = f"data:image/jpeg;base64,{b64}"
+        # Build a data URL from the provided image bytes using a detected MIME type.
+        # This keeps the MIME accurate (e.g. image/png) instead of hardcoding image/jpeg.
+        data_url = self._image_bytes_to_data_url(img_bytes)
         payload = {
             "model": self.model,
             "input": [
