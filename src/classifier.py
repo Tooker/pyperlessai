@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Optional, Dict, Any, List, Any as AnyType
 import asyncio
 import json
+import os
 from pathlib import Path
 
-import httpx
 from loguru import logger
 
 from paperless import PaperlessClient
@@ -20,9 +20,8 @@ class PaperlessOpenAIClassifier:
     This version uses a normal __init__ (no async factory). The actual fetching of
     Paperless entities happens automatically during initialization:
 
-    - If __init__ is called inside a running asyncio event loop and an http_client
-      is provided, prefetch runs as a background task. Call `await classifier.ensure_prefetched()`
-      to wait for completion when needed.
+    - If __init__ is called inside a running asyncio event loop, prefetch runs as a background task.
+      Call `await classifier.ensure_prefetched()` to wait for completion when needed.
 
     - If __init__ is called outside of a running event loop (synchronous context),
       initialization will block and run the prefetch using asyncio.run(...).
@@ -30,7 +29,6 @@ class PaperlessOpenAIClassifier:
     Constructor arguments:
       paperless: PaperlessClient
       ai: AIClient
-      http_client: Optional[httpx.AsyncClient] -- if provided, will be used for fetching lists.
       base_prompt: Optional[str] -- override for the base prompt
       prefetch: bool -- whether to fetch lists during init (default True)
 
@@ -38,20 +36,32 @@ class PaperlessOpenAIClassifier:
       ensure_prefetched() -> awaitable: wait for prefetch to finish (if running in background)
       build_prompt(extra_instructions=None) -> str
       analyze_pdf(pdf_bytes, extra_instructions=None) -> result from AIClient.send_pdf_bytes
-      analyze_paperless_document(doc_id, http_client=None, extra_instructions=None) -> fetch & analyze
+      analyze_paperless_document(doc_id, extra_instructions=None) -> fetch & analyze
     """
 
     def __init__(
         self,
-        paperless: PaperlessClient,
         ai: AIClient,
-        http_client: Optional[httpx.AsyncClient] = None,
+        base_url: Optional[str] = None,
+        api_token: Optional[str] = None,
+        request_timeout: int = 30,
         base_prompt: Optional[str] = None,
         prefetch: bool = True,
     ):
-        self.paperless = paperless
+        """
+        The classifier always creates its own PaperlessClient instance during init.
+        - base_url/api_token can be provided; otherwise environment variables are used.
+        """
+        if ai is None:
+            raise ValueError("AIClient instance (ai) is required")
         self.ai = ai
-        self._external_http_client = http_client
+
+        burl = base_url or os.getenv("PAPERLESS_BASE_URL")
+        token = api_token or os.getenv("PAPERLESS_API_TOKEN")
+        if not burl or not token:
+            raise ValueError("PAPERLESS_BASE_URL and PAPERLESS_API_TOKEN must be provided either as arguments or environment variables")
+        self.paperless = PaperlessClient(base_url=burl, api_token=token, request_timeout=request_timeout)
+
         self.base_prompt = base_prompt or (
             "Analyze the PDF and extract: title, correspondent, tags (max 3), "
             "document_date (YYYY-MM-DD), document_type, language. Prefer values from the allowed lists."
@@ -64,50 +74,32 @@ class PaperlessOpenAIClassifier:
 
         # background prefetch task (if started)
         self._prefetch_task: Optional[asyncio.Task] = None
+        # Remember whether prefetch was requested. Actual prefetching will be
+        # started when entering the classifier's async context so the PaperlessClient's
+        # shared session can be used for best performance.
+        self._prefetch_requested = bool(prefetch)
 
-        if prefetch:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop and self._external_http_client:
-                # Running inside an event loop and an http client is provided:
-                # start background prefetch task (non-blocking). Caller can await ensure_prefetched().
-                logger.info("Starting background prefetch task for Paperless entities.")
-                self._prefetch_task = loop.create_task(self._prefetch(self._external_http_client))
-            else:
-                # No running loop (sync context) or no http client provided: run prefetch synchronously.
-                # This will create its own AsyncClient if needed and run using asyncio.run.
-                logger.info("Running synchronous prefetch for Paperless entities.")
-                asyncio.run(self._prefetch(self._external_http_client))
-
-    async def _prefetch(self, http_client: Optional[httpx.AsyncClient] = None) -> None:
+    async def _prefetch(self) -> None:
         """
         Internal async method to fetch tags, document types and correspondents.
-        If http_client is None, a temporary client will be created and closed.
+        Relies on PaperlessClient to manage httpx client lifecycle.
         """
-        created_client: Optional[httpx.AsyncClient] = None
+        logger.info("Fetching tags, document types, and correspondents from Paperless...")
         try:
-            if http_client is None:
-                created_client = httpx.AsyncClient(headers=self.paperless.headers, timeout=self.paperless.timeout)
-                http_client = created_client
-
-            logger.info("Fetching tags, document types, and correspondents from Paperless...")
             try:
-                self.tags_map = await self.paperless.tags_name_map(http_client)
+                self.tags_map = await self.paperless.tags_name_map()
             except Exception as e:
                 logger.exception("Failed to fetch tags: %s", e)
                 self.tags_map = {}
 
             try:
-                self.document_types_map = await self.paperless.document_types_name_map(http_client)
+                self.document_types_map = await self.paperless.document_types_name_map()
             except Exception as e:
                 logger.exception("Failed to fetch document types: %s", e)
                 self.document_types_map = {}
 
             try:
-                self.correspondents_map = await self.paperless.correspondents_name_map(http_client)
+                self.correspondents_map = await self.paperless.correspondents_name_map()
             except Exception as e:
                 logger.exception("Failed to fetch correspondents: %s", e)
                 self.correspondents_map = {}
@@ -123,9 +115,8 @@ class PaperlessOpenAIClassifier:
                 len(self.document_types_map),
                 len(self.correspondents_map),
             )
-        finally:
-            if created_client is not None:
-                await created_client.aclose()
+        except Exception as e:
+            logger.exception("Unexpected error during prefetch: %s", e)
 
     async def ensure_prefetched(self) -> None:
         """
@@ -135,6 +126,45 @@ class PaperlessOpenAIClassifier:
         if self._prefetch_task:
             await self._prefetch_task
             self._prefetch_task = None
+
+    async def __aenter__(self) -> "PaperlessOpenAIClassifier":
+        """
+        Open the internal PaperlessClient shared session and start prefetch (non-blocking)
+        if it was requested during initialization.
+        """
+        # Open shared PaperlessClient session
+        await self.paperless.__aenter__()
+
+        # Start prefetch after shared session is active for best performance.
+        if self._prefetch_requested:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop:
+                logger.info("Starting background prefetch task for Paperless entities (in __aenter__).")
+                self._prefetch_task = loop.create_task(self._prefetch())
+            else:
+                logger.info("Running synchronous prefetch for Paperless entities (in __aenter__).")
+                await self._prefetch()
+
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        """
+        Ensure any background prefetch finishes and close the internal PaperlessClient session.
+        """
+        try:
+            await self.ensure_prefetched()
+        finally:
+            await self.paperless.__aexit__(exc_type, exc, tb)
+
+    async def list_documents(self, page_size: int = 100, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Convenience wrapper that delegates to the internal PaperlessClient.
+        """
+        return await self.paperless.list_documents(page_size=page_size, limit=limit)
 
     def _format_allowed_section(self, title: str, mapping: Dict[int, str]) -> str:
         lines = [f"{k}: {v}" for k, v in mapping.items()]
@@ -198,7 +228,6 @@ class PaperlessOpenAIClassifier:
     async def analyze_paperless_document(
         self,
         doc_id: int,
-        http_client: Optional[httpx.AsyncClient] = None,
         extra_instructions: Optional[str] = None,
     ) -> AnyType:
         """
@@ -212,24 +241,107 @@ class PaperlessOpenAIClassifier:
         # Wait for prefetch to finish if it's in progress
         await self.ensure_prefetched()
 
-        created_client: Optional[httpx.AsyncClient] = None
-        try:
-            if http_client is None:
-                created_client = httpx.AsyncClient(headers=self.paperless.headers, timeout=self.paperless.timeout)
-                http_client = created_client
+        content = await self.paperless.fetch_document_bytes(None, doc_id)
+        if not content:
+            raise ValueError(f"No content returned for Paperless document id={doc_id}")
 
-            content = await self.paperless.fetch_document_bytes(http_client, doc_id)
-            if not content:
-                raise ValueError(f"No content returned for Paperless document id={doc_id}")
+        if content.startswith(b"%PDF"):
+            return await self.analyze_pdf(content, extra_instructions=extra_instructions)
 
-            if content.startswith(b"%PDF"):
-                return await self.analyze_pdf(content, extra_instructions=extra_instructions)
+        # For non-PDF content, use AI client's vision endpoint (if available)
+        logger.info("Sending image bytes to AI vision endpoint.")
+        return await self.ai.send_image_bytes(content, self.build_prompt(extra_instructions=extra_instructions))
 
-            # Image or other bytes: normalize to JPEG and use vision analysis
-            # Use a sensible default size; caller can normalize externally if needed.
-            norm = AIClient.normalize_image_bytes(content, max_size=1024)
-            prompt_text = self.build_prompt(extra_instructions=extra_instructions)
-            return await self.ai.send_image_bytes(http_client, norm, prompt_text)
-        finally:
-            if created_client is not None:
-                await created_client.aclose()
+    async def _process_document(
+        self,
+        semaphore: asyncio.Semaphore,
+        doc: Dict[str, Any],
+        max_image_size: int,
+        out_dir: str = "poc_output",
+    ) -> None:
+        """
+        Internal per-document processing previously located in poc.py.
+        Fetches document bytes via self.paperless, analyzes with the classifier/AI client,
+        and writes JSON output files under out_dir.
+        """
+        async with semaphore:
+            doc_id = doc.get("id") or doc.get("pk") or doc.get("document_id")
+            title = doc.get("title") or doc.get("name") or "<untitled>"
+            logger.info(f"Processing doc id={doc_id} title={title}")
+            if not doc_id:
+                logger.warning(f"No id found on document: {doc}")
+                return
+
+            os.makedirs(out_dir, exist_ok=True)
+
+            logger.info(f"Analyzing Paperless document id={doc_id} with classifier")
+            try:
+                result = await self.analyze_paperless_document(doc_id, extra_instructions=None)
+
+                # Convert result to JSON for logging/saving in a robust way that handles SDK objects or dicts.
+                raw_json = ""
+                try:
+                    if hasattr(result, "model_dump_json"):
+                        raw_json = result.model_dump_json(indent=2)
+                    else:
+                        raw_json = json.dumps(result, ensure_ascii=False, indent=2)
+                except Exception:
+                    try:
+                        raw_json = json.dumps({"raw": str(result)}, ensure_ascii=False, indent=2)
+                    except Exception:
+                        raw_json = str(result)
+
+                json_out = os.path.join(out_dir, f"{doc_id}.openai.json")
+                json_parsed_out = os.path.join(out_dir, f"{doc_id}.openai_parsed.json")
+
+                with open(json_out, "w", encoding="utf-8") as jf:
+                    jf.write(raw_json)
+
+                # Attempt to save parsed output if available on the SDK object or dict
+                try:
+                    if hasattr(result, "output_parsed"):
+                        parsed_json = result.output_parsed.model_dump_json(indent=2)
+                        with open(json_parsed_out, "w", encoding="utf-8") as parsed:
+                            parsed.write(parsed_json)
+                    elif isinstance(result, dict) and "output_parsed" in result:
+                        with open(json_parsed_out, "w", encoding="utf-8") as parsed:
+                            parsed.write(json.dumps(result["output_parsed"], ensure_ascii=False, indent=2))
+                except Exception:
+                    # Ignore parsing save errors; main result is already saved.
+                    pass
+
+                logger.info(f"Saved OpenAI JSON result to {json_out}")
+            except Exception as e:
+                logger.exception("Failed to call classifier for doc %s: %s", doc_id, e)
+            return
+
+    async def run(
+        self,
+        limit: int = 10,
+        page_size: int = 500,
+        concurrent_workers: int = 4,
+        max_image_size: int = 1024,
+        out_dir: str = "poc_output",
+    ) -> None:
+        """
+        Convenience method to run the end-to-end flow:
+         - open internal PaperlessClient session
+         - list documents
+         - ensure prefetch
+         - process documents concurrently
+        """
+        # Ensure output directory exists before running
+        os.makedirs(out_dir, exist_ok=True)
+
+        async with self:
+            docs = await self.list_documents(page_size=page_size, limit=limit)
+            logger.info(f"Found {len(docs)} documents (requested limit={limit})")
+
+            # Wait for classifier prefetch to finish (if it ran in background)
+            await self.ensure_prefetched()
+
+            semaphore = asyncio.Semaphore(concurrent_workers)
+            tasks = []
+            for doc in docs:
+                tasks.append(self._process_document(semaphore, doc, max_image_size, out_dir=out_dir))
+            await asyncio.gather(*tasks)

@@ -1,5 +1,5 @@
 import os
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import httpx
 from loguru import logger
@@ -8,11 +8,13 @@ class PaperlessClient:
     """
     Encapsulates communication with a paperless-ngx instance.
 
-    Usage:
-        client = PaperlessClient(base_url="https://paperless.example", api_token="TOKEN")
-        async with httpx.AsyncClient(headers=client.headers, timeout=client.timeout) as session:
-            docs = await client.list_documents(session, page_size=100, limit=10)
-            data = await client.fetch_document_bytes(session, doc_id)
+    Usage (preferred for long-running/bulk operations):
+        async with PaperlessClient(base_url="https://paperless.example", api_token="TOKEN") as client:
+            docs = await client.list_documents(page_size=100, limit=10)
+            data = await client.fetch_document_bytes(doc_id)
+
+    The client also remains usable without the context manager: methods will create and close
+    temporary httpx.AsyncClient instances when no shared client is active.
     """
 
     def __init__(self, base_url: str, api_token: str, request_timeout: int = 30):
@@ -28,6 +30,39 @@ class PaperlessClient:
         # httpx.Timeout expects seconds for connect/read/write; use a reasonable connect timeout.
         self.timeout = httpx.Timeout(self.request_timeout, connect=10.0)
 
+        # Shared AsyncClient when used as an async context manager
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def __aenter__(self) -> "PaperlessClient":
+        if self._client is None:
+            self._client = httpx.AsyncClient(headers=self.headers, timeout=self.timeout)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            finally:
+                self._client = None
+
+    async def _acquire_client(self, external: Optional[httpx.AsyncClient] = None) -> Tuple[httpx.AsyncClient, bool]:
+        """
+        Decide which httpx.AsyncClient to use for an operation.
+
+        Precedence:
+          1) If a shared client (self._client) exists, use it and indicate it should NOT be closed.
+          2) Else if an external client was supplied, use it and indicate it should NOT be closed.
+          3) Otherwise create a temporary client and indicate it SHOULD be closed by the caller.
+        Returns (client, should_close)
+        """
+        if self._client is not None:
+            return self._client, False
+        if external is not None:
+            return external, False
+
+        client = httpx.AsyncClient(headers=self.headers, timeout=self.timeout)
+        return client, True
+
     async def list_documents(
         self,
         client: Optional[httpx.AsyncClient] = None,
@@ -35,14 +70,17 @@ class PaperlessClient:
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Return a list of document objects. Accepts an existing httpx.AsyncClient or
-        will create/close its own client if 'client' is None.
+        Return a list of document objects. Accepts an existing httpx.AsyncClient (for
+        backwards compatibility) or will use the shared client when PaperlessClient
+        is used as a context manager. If no client is available, a temporary client
+        will be created and closed automatically.
+
         The method is tolerant of different shapes (DRF-style 'results'/'next' or direct lists).
         """
         created_client = None
-        if client is None:
-            created_client = httpx.AsyncClient(headers=self.headers, timeout=self.timeout)
-            client = created_client
+        client, created = await self._acquire_client(client)
+        if created:
+            created_client = client
 
         docs: List[Dict[str, Any]] = []
         next_url = f"{self.base_url}/api/documents/?page_size={page_size}"
@@ -78,15 +116,14 @@ class PaperlessClient:
     ) -> Optional[bytes]:
         """
         Attempts to fetch a document's thumbnail, falling back to download.
-        Accepts an httpx.AsyncClient instance (recommended).
+        Accepts an httpx.AsyncClient instance (recommended) for backwards compatibility.
+        When PaperlessClient is used as a context manager, the shared client will be used.
         Returns bytes (image/pdf) or None.
         """
-        if client is None:
-            # Create a temporary client if not provided
-            client = httpx.AsyncClient(headers=self.headers, timeout=self.timeout)
+        created_client = None
+        client, created = await self._acquire_client(client)
+        if created:
             created_client = client
-        else:
-            created_client = None
 
         try:
             thumb_url = f"{self.base_url}/api/documents/{doc_id}/thumbnail/"
@@ -142,9 +179,9 @@ class PaperlessClient:
         Tries each endpoint in order until it finds one that returns results.
         """
         created_client = None
-        if client is None:
-            created_client = httpx.AsyncClient(headers=self.headers, timeout=self.timeout)
-            client = created_client
+        client, created = await self._acquire_client(client)
+        if created:
+            created_client = client
 
         try:
             for ep in endpoints:

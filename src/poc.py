@@ -60,17 +60,14 @@ if not OPENAI_API_KEY:
     sys.exit(1)
 
 # Import refactored clients
-from paperless import PaperlessClient
 from ai_client import AIClient
 from classifier import PaperlessOpenAIClassifier
 
 
 async def process_document(
     semaphore: asyncio.Semaphore,
-    paperless: PaperlessClient,
     ai: AIClient,
     classifier: PaperlessOpenAIClassifier,
-    http_client,
     doc: Dict[str, Any],
     max_image_size: int,
     out_dir: str = "poc_output",
@@ -83,74 +80,64 @@ async def process_document(
             logger.warning(f"No id found on document: {doc}")
             return
 
-        # Fetch raw bytes once (we'll reuse for saving/analysis)
-        content = await paperless.fetch_document_bytes(http_client, doc_id)
-        if not content:
-            logger.warning(f"No thumbnail/download available for doc {doc_id}")
-            return
-
         os.makedirs(out_dir, exist_ok=True)
 
-        # If PDF, analyze via classifier (uses grounded prompt)
-        
-        logger.info(f"Downloaded content is PDF for doc {doc_id} — analyzing with classifier")
+        logger.info(f"Analyzing Paperless document id={doc_id} with classifier")
         try:
-            result = await classifier.analyze_pdf(content)
-            # Convert SDK object to serializable dict if possible
+            # Classifier now handles fetching the document bytes via the provided PaperlessClient.
+            result = await classifier.analyze_paperless_document(doc_id, extra_instructions=None)
+
+            # Convert result to JSON for logging/saving in a robust way that handles SDK objects or dicts.
+            raw_json = ""
             try:
-                if hasattr(result, "to_dict"):
-                    result_obj = result.to_dict()
-                elif isinstance(result, dict):
-                    result_obj = result
+                if hasattr(result, "model_dump_json"):
+                    raw_json = result.model_dump_json(indent=2)
                 else:
-                    result_obj = {"raw": str(result)}
+                    raw_json = json.dumps(result, ensure_ascii=False, indent=2)
             except Exception:
-                result_obj = {"raw": str(result)}
-            print(result_obj)
+                try:
+                    raw_json = json.dumps({"raw": str(result)}, ensure_ascii=False, indent=2)
+                except Exception:
+                    raw_json = str(result)
+
             json_out = os.path.join(out_dir, f"{doc_id}.openai.json")
             json_parsed_out = os.path.join(out_dir, f"{doc_id}.openai_parsed.json")
-            import json
 
             with open(json_out, "w", encoding="utf-8") as jf:
-                jf.write(result.model_dump_json(indent=2))
-            with open(json_parsed_out,"w", encoding="utf-8") as parsed:
-                parsed.write(result.output_parsed.model_dump_json(indent=2))
-            
+                jf.write(raw_json)
+
+            # Attempt to save parsed output if available on the SDK object or dict
+            try:
+                if hasattr(result, "output_parsed"):
+                    parsed_json = result.output_parsed.model_dump_json(indent=2)
+                    with open(json_parsed_out, "w", encoding="utf-8") as parsed:
+                        parsed.write(parsed_json)
+                elif isinstance(result, dict) and "output_parsed" in result:
+                    with open(json_parsed_out, "w", encoding="utf-8") as parsed:
+                        parsed.write(json.dumps(result["output_parsed"], ensure_ascii=False, indent=2))
+            except Exception:
+                # Ignore parsing save errors; main result is already saved.
+                pass
+
             logger.info(f"Saved OpenAI JSON result to {json_out}")
         except Exception as e:
-            logger.exception("Failed to call OpenAI for PDF doc %s: %s", doc_id, e)
+            logger.exception("Failed to call classifier for doc %s: %s", doc_id, e)
         return
-
-        
 
 
 async def main(limit: int = 10, page_size: int = 500):
-    paperless = PaperlessClient(base_url=PAPERLESS_BASE_URL, api_token=PAPERLESS_API_TOKEN, request_timeout=REQUEST_TIMEOUT)
     ai = AIClient(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, request_timeout=120)
 
-    # Single shared httpx client for paperless fetching and image-based OpenAI requests
-    headers = {"Authorization": f"Token {PAPERLESS_API_TOKEN}"}
-    timeout = httpx_timeout = None
     try:
-        import httpx
-        timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=10.0)
-        async with httpx.AsyncClient(headers=headers, timeout=timeout) as http_client:
-            docs = await paperless.list_documents(http_client, page_size=page_size, limit=limit)
-            logger.info(f"Found {len(docs)} documents (requested limit={limit})")
-
-            # Also fetch auxiliary interfaces: tags, document types, correspondents
-            out_dir = "poc_output"
-            os.makedirs(out_dir, exist_ok=True)
-
-            # Create classifier (prefetches paperless entities). Wait for prefetch to finish.
-            classifier = PaperlessOpenAIClassifier(paperless, ai, http_client=http_client, base_prompt=SETTINGS_PROMPT)
-            await classifier.ensure_prefetched()
-
-            semaphore = asyncio.Semaphore(CONCURRENT_WORKERS)
-            tasks = []
-            for doc in docs:
-                tasks.append(process_document(semaphore, paperless, ai, classifier, http_client, doc, MAX_IMAGE_SIZE))
-            await asyncio.gather(*tasks)
+        # Create classifier which owns its PaperlessClient internally and run the end-to-end flow.
+        classifier = PaperlessOpenAIClassifier(ai=ai, base_url=PAPERLESS_BASE_URL, api_token=PAPERLESS_API_TOKEN, base_prompt=SETTINGS_PROMPT)
+        await classifier.run(
+            limit=limit,
+            page_size=page_size,
+            concurrent_workers=CONCURRENT_WORKERS,
+            max_image_size=MAX_IMAGE_SIZE,
+            out_dir="poc_output",
+        )
     except Exception as e:
         logger.exception("Unexpected error in main: %s", e)
 
