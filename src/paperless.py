@@ -348,3 +348,112 @@ class PaperlessClient:
         Return a pretty-printed string of correspondent id -> name pairs (one per line).
         """
         return self._pretty_from_map(await self.correspondents_name_map(client=client))
+
+
+    async def create_tag(self, name: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
+        """
+        Create a tag in the Paperless instance. Returns the created tag object on success,
+        or an empty dict on failure.
+        """
+        created_client = None
+        client, created = await self._acquire_client(client)
+        if created:
+            created_client = client
+
+        try:
+            url = f"{self.base_url}/api/tags/"
+            logger.info(f"Creating tag '{name}' via {url}")
+            resp = await client.post(url, json={"name": name})
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.exception("Failed to create tag: %s", e)
+            return {}
+        finally:
+            if created_client:
+                await created_client.aclose()
+
+
+    async def create_document_type(self, name: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
+        """
+        Create a document type in the Paperless instance. Returns the created document type object
+        on success or an empty dict on failure.
+        """
+        created_client = None
+        client, created = await self._acquire_client(client)
+        if created:
+            created_client = client
+
+        try:
+            url = f"{self.base_url}/api/document_types/"
+            logger.info(f"Creating document type '{name}' via {url}")
+            resp = await client.post(url, json={"name": name})
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.exception("Failed to create document type: %s", e)
+            return {}
+        finally:
+            if created_client:
+                await created_client.aclose()
+
+
+    async def create_correspondent(
+        self,
+        name: str,
+        email: Optional[str] = None,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a correspondent/contact in the Paperless instance. Email is optional.
+        Returns the created correspondent object on success, or an empty dict on failure.
+        """
+        created_client = None
+        client, created = await self._acquire_client(client)
+        if created:
+            created_client = client
+
+        try:
+            url = f"{self.base_url}/api/correspondents/"
+            payload: Dict[str, Any] = {"name": name}
+            if email:
+                payload["email"] = email
+            logger.info(f"Creating correspondent '{name}' via {url}")
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.exception("Failed to create correspondent: %s", e)
+            return {}
+        finally:
+            if created_client:
+                await created_client.aclose()
+
+
+    async def update_document(
+        self,
+        doc_id: int,
+        data: Dict[str, Any],
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> Dict[str, Any]:
+        """
+        Update an existing document by ID using PATCH with the provided data dict.
+        Returns the updated document object on success, or an empty dict on failure.
+        """
+        created_client = None
+        client, created = await self._acquire_client(client)
+        if created:
+            created_client = client
+
+        try:
+            url = f"{self.base_url}/api/documents/{doc_id}/"
+            logger.info(f"Patching document {doc_id} via {url} with data keys: {list(data.keys())}")
+            resp = await client.patch(url, json=data)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.exception("Failed to update document %s: %s", doc_id, e)
+            return {}
+        finally:
+            if created_client:
+                await created_client.aclose()
