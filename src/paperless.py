@@ -3,6 +3,7 @@ from typing import Optional, List, Dict, Any, Tuple
 
 import httpx
 from loguru import logger
+from schemas import DocumentMetadata
 
 class PaperlessClient:
     """
@@ -428,6 +429,129 @@ class PaperlessClient:
         finally:
             if created_client:
                 await created_client.aclose()
+
+
+    async def get_or_create_correspondent(self, name: Optional[str], client: Optional[httpx.AsyncClient] = None) -> Optional[int]:
+        """
+        Return the correspondent id for the given name (case-insensitive). If no correspondent exists,
+        attempt to create one and return its id. Returns None on failure or if name is empty.
+        """
+        if not name:
+            return None
+        try:
+            # try to find existing correspondent by name (case-insensitive)
+            name_map = await self.correspondents_name_map(client=client)
+            target = name.strip().casefold()
+            for k, v in name_map.items():
+                if v and v.strip().casefold() == target:
+                    return k
+            # create if not found
+            created = await self.create_correspondent(name, client=client)
+            if created and "id" in created:
+                return int(created["id"])
+        except Exception as e:
+            logger.warning(f"get_or_create_correspondent failed for '{name}': {e}")
+        return None
+
+    async def get_or_create_tag(self, name: Optional[str], client: Optional[httpx.AsyncClient] = None) -> Optional[int]:
+        """
+        Return the tag id for the given name (case-insensitive). If no tag exists,
+        attempt to create one and return its id. Returns None on failure or if name is empty.
+        """
+        if not name:
+            return None
+        try:
+            name_map = await self.tags_name_map(client=client)
+            target = name.strip().casefold()
+            for k, v in name_map.items():
+                if v and v.strip().casefold() == target:
+                    return k
+            created = await self.create_tag(name, client=client)
+            if created and "id" in created:
+                return int(created["id"])
+        except Exception as e:
+            logger.warning(f"get_or_create_tag failed for '{name}': {e}")
+        return None
+
+    async def get_or_create_document_type(self, name: Optional[str], client: Optional[httpx.AsyncClient] = None) -> Optional[int]:
+        """
+        Return the document type id for the given name (case-insensitive). If no document type exists,
+        attempt to create one and return its id. Returns None on failure or if name is empty.
+        """
+        if not name:
+            return None
+        try:
+            name_map = await self.document_types_name_map(client=client)
+            target = name.strip().casefold()
+            for k, v in name_map.items():
+                if v and v.strip().casefold() == target:
+                    return k
+            created = await self.create_document_type(name, client=client)
+            if created and "id" in created:
+                return int(created["id"])
+        except Exception as e:
+            logger.warning(f"get_or_create_document_type failed for '{name}': {e}")
+        return None
+
+    async def update_document_from_metadata(
+        self,
+        doc_id: int,
+        metadata: DocumentMetadata,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> Dict[str, Any]:
+        """
+        Convenience wrapper to construct a Paperless document payload from a DocumentMetadata
+        instance and PATCH the document. Ensures correspondent/tag/document_type exist (creating them if necessary).
+        Returns the updated document object, or an empty dict on failure / no-op.
+        """
+        if not metadata:
+            return {}
+
+        try:
+            payload: Dict[str, Any] = {}
+
+            if metadata.title:
+                payload["title"] = metadata.title
+
+            # correspondent
+            if metadata.correspondent:
+                corr_id = await self.get_or_create_correspondent(metadata.correspondent, client=client)
+                if corr_id is not None:
+                    payload["correspondent"] = corr_id
+
+            # tags
+            tag_ids: List[int] = []
+            for tag_name in metadata.tags or []:
+                if not tag_name:
+                    continue
+                tid = await self.get_or_create_tag(tag_name, client=client)
+                if tid is not None:
+                    tag_ids.append(tid)
+            if tag_ids:
+                payload["tags"] = tag_ids
+
+            # document type
+            if metadata.document_type:
+                dtid = await self.get_or_create_document_type(metadata.document_type, client=client)
+                if dtid is not None:
+                    payload["document_type"] = dtid
+
+            # document date
+            if metadata.document_date:
+                try:
+                    payload["document_date"] = metadata.document_date.isoformat()  # type: ignore[attr-defined]
+                except Exception:
+                    payload["document_date"] = str(metadata.document_date)
+
+            if not payload:
+                logger.info(f"No updatable fields found in metadata for document id={doc_id}")
+                return {}
+
+            updated = await self.update_document(doc_id, payload, client=client)
+            return updated or {}
+        except Exception as e:
+            logger.exception(f"Failed to update document id={doc_id} from metadata: {e}")
+            return {}
 
 
     async def update_document(
