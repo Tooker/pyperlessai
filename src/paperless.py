@@ -11,7 +11,7 @@ class PaperlessClient:
 
     Usage (preferred for long-running/bulk operations):
         async with PaperlessClient(base_url="https://paperless.example", api_token="TOKEN") as client:
-            docs = await client.list_documents(page_size=100, limit=10)
+            docs = await client.list_documents(limit=10)
             data = await client.fetch_document_bytes(doc_id)
 
     The client also remains usable without the context manager: methods will create and close
@@ -67,7 +67,6 @@ class PaperlessClient:
     async def list_documents(
         self,
         client: Optional[httpx.AsyncClient] = None,
-        page_size: int = 100,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -84,7 +83,7 @@ class PaperlessClient:
             created_client = client
 
         docs: List[Dict[str, Any]] = []
-        next_url = f"{self.base_url}/api/documents/?page_size={page_size}"
+        next_url = f"{self.base_url}/api/documents/"
 
         try:
             while next_url:
@@ -103,7 +102,9 @@ class PaperlessClient:
                 if limit and len(docs) >= limit:
                     return docs[:limit]
 
-                next_url = data.get("next")
+                
+                if next_url := data.get("next"):
+                    next_url = next_url.replace("http://","https://")
         finally:
             if created_client:
                 await created_client.aclose()
@@ -172,7 +173,6 @@ class PaperlessClient:
         self,
         client: Optional[httpx.AsyncClient],
         endpoints: List[str],
-        page_size: int = 500,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -187,11 +187,11 @@ class PaperlessClient:
         try:
             for ep in endpoints:
                 items: List[Dict[str, Any]] = []
-                next_url = f"{self.base_url}/api/{ep}/?page_size={page_size}"
+                next_url = f"{self.base_url}/api/{ep}/"
                 try:
                     while next_url:
                         next_url = next_url.replace("http://","https://")
-                        logger.info(f"Fetching {ep} page: {next_url}")
+                        logger.debug(f"Fetching {ep} page: {next_url}")
                         resp = await client.get(next_url)
                         # If endpoint not found, try the next candidate
                         if resp.status_code == 404:
@@ -233,7 +233,6 @@ class PaperlessClient:
     async def list_tags(
         self,
         client: Optional[httpx.AsyncClient] = None,
-        page_size: int = 100,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -241,50 +240,65 @@ class PaperlessClient:
         Tries common tag endpoint paths.
         """
         endpoints = ["tags"]
-        return await self._fetch_list(client, endpoints, page_size=page_size, limit=limit)
+        return await self._fetch_list(client, endpoints, limit=limit)
 
 
     async def list_document_types(
         self,
         client: Optional[httpx.AsyncClient] = None,
-        page_size: int = 100,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         Return a list of document type objects. Tries several common endpoint name variants.
         """
         endpoints = ["document_types"]
-        return await self._fetch_list(client, endpoints, page_size=page_size, limit=limit)
+        return await self._fetch_list(client, endpoints, limit=limit)
 
 
     async def list_correspondents(
         self,
         client: Optional[httpx.AsyncClient] = None,
-        page_size: int = 100,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         Return a list of correspondent/contact objects. Tries a few possible endpoint names.
         """
         endpoints = ["correspondents"]
-        return await self._fetch_list(client, endpoints, page_size=page_size, limit=limit)
+        return await self._fetch_list(client, endpoints, limit=limit)
 
 
     # Utilities to produce simplified id -> name maps and pretty-printed representations
     def _name_map_from_items(self, items: List[Dict[str, Any]]) -> Dict[int, str]:
         """
         Build a mapping of item id -> item name from a list of dict-like items.
-        Skips items that do not contain both 'id' and 'name'.
+
+        This helper is more tolerant about variations in API responses: some Paperless
+        deployments return 'id', others 'pk'. Likewise the name field may be 'name'
+        or 'title'. Accept both forms and skip malformed entries.
         """
         result: Dict[int, str] = {}
         for item in items:
             try:
-                if "id" in item and "name" in item:
-                    result[int(item["id"])] = item.get("name", "")
+                id_val = item.get("id") if isinstance(item, dict) else None
+                if id_val is None:
+                    id_val = item.get("pk") if isinstance(item, dict) else None
+
+                # Accept a few possible name fields
+                name_val = None
+                if isinstance(item, dict):
+                    name_val = item.get("name") or item.get("title") or item.get("label")
+
+                if id_val is not None and name_val is not None:
+                    try:
+                        result[int(id_val)] = name_val
+                    except Exception:
+                        # skip items with non-int ids
+                        continue
             except Exception:
                 # Ignore malformed items
                 continue
-        return result
+        # keep deterministic ordering by id
+        return dict(sorted(result.items()))
 
     def _pretty_from_map(self, m: Dict[int, str]) -> str:
         """
@@ -354,7 +368,7 @@ class PaperlessClient:
     async def create_tag(self, name: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
         """
         Create a tag in the Paperless instance. Returns the created tag object on success,
-        or an empty dict on failure.
+        or an empty dict on failure. Adds additional debug logging on non-2xx responses.
         """
         created_client = None
         client, created = await self._acquire_client(client)
@@ -365,8 +379,23 @@ class PaperlessClient:
             url = f"{self.base_url}/api/tags/"
             logger.info(f"Creating tag '{name}' via {url}")
             resp = await client.post(url, json={"name": name})
-            resp.raise_for_status()
-            return resp.json()
+            # Prefer explicit handling so we can log body on failure
+            try:
+                resp.raise_for_status()
+            except Exception:
+                body = ""
+                try:
+                    body = resp.text
+                except Exception:
+                    body = "<unavailable>"
+                logger.warning(f"create_tag failed: status={resp.status_code} body={body}")
+                return {}
+
+            try:
+                return resp.json()
+            except Exception:
+                logger.warning("create_tag: response is not valid JSON")
+                return {}
         except Exception as e:
             logger.exception("Failed to create tag: %s", e)
             return {}
@@ -378,7 +407,7 @@ class PaperlessClient:
     async def create_document_type(self, name: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
         """
         Create a document type in the Paperless instance. Returns the created document type object
-        on success or an empty dict on failure.
+        on success or an empty dict on failure. Adds additional debug logging on non-2xx responses.
         """
         created_client = None
         client, created = await self._acquire_client(client)
@@ -389,8 +418,22 @@ class PaperlessClient:
             url = f"{self.base_url}/api/document_types/"
             logger.info(f"Creating document type '{name}' via {url}")
             resp = await client.post(url, json={"name": name})
-            resp.raise_for_status()
-            return resp.json()
+            try:
+                resp.raise_for_status()
+            except Exception:
+                body = ""
+                try:
+                    body = resp.text
+                except Exception:
+                    body = "<unavailable>"
+                logger.warning(f"create_document_type failed: status={resp.status_code} body={body}")
+                return {}
+
+            try:
+                return resp.json()
+            except Exception:
+                logger.warning("create_document_type: response is not valid JSON")
+                return {}
         except Exception as e:
             logger.exception("Failed to create document type: %s", e)
             return {}
@@ -408,6 +451,7 @@ class PaperlessClient:
         """
         Create a correspondent/contact in the Paperless instance. Email is optional.
         Returns the created correspondent object on success, or an empty dict on failure.
+        Adds additional debug logging on non-2xx responses.
         """
         created_client = None
         client, created = await self._acquire_client(client)
@@ -421,8 +465,22 @@ class PaperlessClient:
                 payload["email"] = email
             logger.info(f"Creating correspondent '{name}' via {url}")
             resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            return resp.json()
+            try:
+                resp.raise_for_status()
+            except Exception:
+                body = ""
+                try:
+                    body = resp.text
+                except Exception:
+                    body = "<unavailable>"
+                logger.warning(f"create_correspondent failed: status={resp.status_code} body={body}")
+                return {}
+
+            try:
+                return resp.json()
+            except Exception:
+                logger.warning("create_correspondent: response is not valid JSON")
+                return {}
         except Exception as e:
             logger.exception("Failed to create correspondent: %s", e)
             return {}
@@ -447,8 +505,11 @@ class PaperlessClient:
                     return k
             # create if not found
             created = await self.create_correspondent(name, client=client)
-            if created and "id" in created:
-                return int(created["id"])
+            if created:
+                # accept either 'id' or 'pk' in created object
+                id_val = created.get("id") or created.get("pk")
+                if id_val is not None:
+                    return int(id_val)
         except Exception as e:
             logger.warning(f"get_or_create_correspondent failed for '{name}': {e}")
         return None
@@ -467,8 +528,10 @@ class PaperlessClient:
                 if v and v.strip().casefold() == target:
                     return k
             created = await self.create_tag(name, client=client)
-            if created and "id" in created:
-                return int(created["id"])
+            if created:
+                id_val = created.get("id") or created.get("pk")
+                if id_val is not None:
+                    return int(id_val)
         except Exception as e:
             logger.warning(f"get_or_create_tag failed for '{name}': {e}")
         return None
@@ -487,8 +550,10 @@ class PaperlessClient:
                 if v and v.strip().casefold() == target:
                     return k
             created = await self.create_document_type(name, client=client)
-            if created and "id" in created:
-                return int(created["id"])
+            if created:
+                id_val = created.get("id") or created.get("pk")
+                if id_val is not None:
+                    return int(id_val)
         except Exception as e:
             logger.warning(f"get_or_create_document_type failed for '{name}': {e}")
         return None

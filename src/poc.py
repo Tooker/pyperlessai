@@ -125,7 +125,7 @@ async def process_document(
         return
 
 
-async def main(limit: int = 10, page_size: int = 500):
+async def main(limit: int = 10):
     ai = AIClient(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, request_timeout=120)
 
     try:
@@ -133,7 +133,6 @@ async def main(limit: int = 10, page_size: int = 500):
         classifier = PaperlessOpenAIClassifier(ai=ai, base_url=PAPERLESS_BASE_URL, api_token=PAPERLESS_API_TOKEN, base_prompt=SETTINGS_PROMPT)
         await classifier.run(
             limit=limit,
-            page_size=page_size,
             concurrent_workers=CONCURRENT_WORKERS,
             max_image_size=MAX_IMAGE_SIZE,
             out_dir="poc_output",
@@ -147,11 +146,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--limit", type=int, default=1, help="Maximum number of documents to process"
     )
-    parser.add_argument(
-        "--page_size", type=int, default=500, help="Page size when listing documents"
-    )
+    
     args = parser.parse_args()
     try:
-        asyncio.run(main(limit=args.limit, page_size=args.page_size))
+        asyncio.run(main(limit=args.limit))
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

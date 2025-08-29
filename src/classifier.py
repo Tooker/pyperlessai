@@ -244,11 +244,11 @@ class PaperlessOpenAIClassifier:
         finally:
             await self.paperless.__aexit__(exc_type, exc, tb)
 
-    async def list_documents(self, page_size: int = 100, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    async def list_documents(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Convenience wrapper that delegates to the internal PaperlessClient.
         """
-        return await self.paperless.list_documents(page_size=page_size, limit=limit)
+        return await self.paperless.list_documents(limit=limit)
 
     def _format_allowed_section(self, title: str, mapping: Dict[int, str]) -> str:
         lines = [f"{k}: {v}" for k, v in mapping.items()]
@@ -322,7 +322,7 @@ class PaperlessOpenAIClassifier:
         except Exception:
             logger.warning("Failed to refresh tags before sending PDF to OpenAI; proceeding with cached tags")
         prompt_text = self.build_prompt(extra_instructions=extra_instructions)
-        logger.info("Sending PDF to OpenAI with grounded context (tags, correspondents, document types).")
+        logger.debug("Sending PDF to OpenAI with grounded context (tags, correspondents, document types).")
         result = await self.ai.send_pdf_bytes(pdf_bytes, prompt_text)
 
         # Attempt to extract parsed output that matches DocumentMetadata
@@ -405,8 +405,6 @@ class PaperlessOpenAIClassifier:
         if content.startswith(b"%PDF"):
             return await self.analyze_pdf(content, extra_instructions=extra_instructions, paperless_doc_id=doc_id)
 
-        # For non-PDF content, use AI client's vision endpoint (if available)
-        # Refresh tags before building prompt for vision call
         try:
             self.tags_map = await self.paperless.tags_name_map()
         except Exception:
@@ -418,7 +416,6 @@ class PaperlessOpenAIClassifier:
         self,
         semaphore: asyncio.Semaphore,
         doc: Dict[str, Any],
-        max_image_size: int,
         out_dir: str = "poc_output",
     ) -> None:
         """
@@ -427,8 +424,8 @@ class PaperlessOpenAIClassifier:
         and writes JSON output files under out_dir.
         """
         async with semaphore:
-            doc_id = doc.get("id") or doc.get("pk") or doc.get("document_id")
-            title = doc.get("title") or doc.get("name") or "<untitled>"
+            doc_id = doc.get("id")
+            title = doc.get("title") or "<untitled>"
             logger.info(f"Processing doc id={doc_id} title={title}")
             if not doc_id:
                 logger.warning(f"No id found on document: {doc}")
@@ -447,37 +444,37 @@ class PaperlessOpenAIClassifier:
         try:
             result = await self.analyze_paperless_document(doc_id, extra_instructions=None)
 
-            # Convert result to JSON for logging/saving in a robust way that handles SDK objects or dicts.
-            raw_json = ""
-            try:
-                if hasattr(result, "model_dump_json"):
-                    raw_json = result.model_dump_json(indent=2)
-                else:
-                    raw_json = json.dumps(result, ensure_ascii=False, indent=2)
-            except Exception:
-                try:
-                    raw_json = json.dumps({"raw": str(result)}, ensure_ascii=False, indent=2)
-                except Exception:
-                    raw_json = str(result)
+            # # Convert result to JSON for logging/saving in a robust way that handles SDK objects or dicts.
+            # raw_json = ""
+            # try:
+            #     if hasattr(result, "model_dump_json"):
+            #         raw_json = result.model_dump_json(indent=2)
+            #     else:
+            #         raw_json = json.dumps(result, ensure_ascii=False, indent=2)
+            # except Exception:
+            #     try:
+            #         raw_json = json.dumps({"raw": str(result)}, ensure_ascii=False, indent=2)
+            #     except Exception:
+            #         raw_json = str(result)
 
-            json_out = os.path.join(out_dir, f"{doc_id}.openai.json")
-            json_parsed_out = os.path.join(out_dir, f"{doc_id}.openai_parsed.json")
+            # json_out = os.path.join(out_dir, f"{doc_id}.openai.json")
+            # json_parsed_out = os.path.join(out_dir, f"{doc_id}.openai_parsed.json")
 
-            with open(json_out, "w", encoding="utf-8") as jf:
-                jf.write(raw_json)
+            # with open(json_out, "w", encoding="utf-8") as jf:
+            #     jf.write(raw_json)
 
-            # Attempt to save parsed output if available on the SDK object or dict
-            try:
-                if hasattr(result, "output_parsed"):
-                    parsed_json = result.output_parsed.model_dump_json(indent=2)
-                    with open(json_parsed_out, "w", encoding="utf-8") as parsed:
-                        parsed.write(parsed_json)
-                elif isinstance(result, dict) and "output_parsed" in result:
-                    with open(json_parsed_out, "w", encoding="utf-8") as parsed:
-                        parsed.write(json.dumps(result["output_parsed"], ensure_ascii=False, indent=2))
-            except Exception:
-                # Ignore parsing save errors; main result is already saved.
-                pass
+            # # Attempt to save parsed output if available on the SDK object or dict
+            # try:
+            #     if hasattr(result, "output_parsed"):
+            #         parsed_json = result.output_parsed.model_dump_json(indent=2)
+            #         with open(json_parsed_out, "w", encoding="utf-8") as parsed:
+            #             parsed.write(parsed_json)
+            #     elif isinstance(result, dict) and "output_parsed" in result:
+            #         with open(json_parsed_out, "w", encoding="utf-8") as parsed:
+            #             parsed.write(json.dumps(result["output_parsed"], ensure_ascii=False, indent=2))
+            # except Exception:
+            #     # Ignore parsing save errors; main result is already saved.
+            #     pass
 
             # After successful processing, attempt to add the AI_Processed tag to the Paperless document.
             try:
@@ -486,7 +483,6 @@ class PaperlessOpenAIClassifier:
                 # _add_ai_processed_tag logs its own errors; don't let tagging failures interrupt the main flow.
                 pass
 
-            logger.info(f"Saved OpenAI JSON result to {json_out}")
         except Exception as e:
             logger.exception(f"Failed to call classifier for doc {doc_id}: {e}")
         return
@@ -494,7 +490,6 @@ class PaperlessOpenAIClassifier:
     async def run(
         self,
         limit: int = 10,
-        page_size: int = 500,
         concurrent_workers: int = 4,
         max_image_size: int = 1024,
         out_dir: str = "poc_output",
@@ -510,7 +505,7 @@ class PaperlessOpenAIClassifier:
         os.makedirs(out_dir, exist_ok=True)
 
         async with self:
-            docs = await self.list_documents(page_size=page_size, limit=limit)
+            docs = await self.list_documents(limit=limit)
             logger.info(f"Found {len(docs)} documents (requested limit={limit})")
 
             # Wait for classifier prefetch to finish (if it ran in background)
@@ -519,5 +514,5 @@ class PaperlessOpenAIClassifier:
             semaphore = asyncio.Semaphore(concurrent_workers)
             tasks = []
             for doc in docs:
-                tasks.append(self._process_document(semaphore, doc, max_image_size, out_dir=out_dir))
+                tasks.append(self._process_document(semaphore, doc, out_dir=out_dir))
             await asyncio.gather(*tasks)
