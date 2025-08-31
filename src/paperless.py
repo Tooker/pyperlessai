@@ -3,7 +3,7 @@ from typing import Optional, List, Dict, Any, Tuple
 
 import httpx
 from loguru import logger
-from schemas import DocumentMetadata
+from schemas import DocumentMetadata, Document, Tag, DocumentType, Correspondent
 
 class PaperlessClient:
     """
@@ -34,6 +34,7 @@ class PaperlessClient:
         # Shared AsyncClient when used as an async context manager
         self._client: Optional[httpx.AsyncClient] = None
 
+        
     async def __aenter__(self) -> "PaperlessClient":
         if self._client is None:
             self._client = httpx.AsyncClient(headers=self.headers, timeout=self.timeout)
@@ -64,23 +65,33 @@ class PaperlessClient:
         client = httpx.AsyncClient(headers=self.headers, timeout=self.timeout)
         return client, True
 
+    async def _updateInternalMaps(self):
+        self._tags = await self.list_tags()
+        self._docTypes = await self.list_document_types()
+        self._correspondents = await self.list_correspondents()
+
+        logger.info(self._correspondents)
+        pass
+
     async def list_documents(
         self,
         client: Optional[httpx.AsyncClient] = None,
         limit: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Document]:
         """
-        Return a list of document objects. Accepts an existing httpx.AsyncClient (for
-        backwards compatibility) or will use the shared client when PaperlessClient
-        is used as a context manager. If no client is available, a temporary client
-        will be created and closed automatically.
+        Return a list of Document models (normalized). Accepts an existing httpx.AsyncClient
+        or will use the shared client when PaperlessClient is used as a context manager.
+        If no client is available, a temporary client will be created and closed automatically.
 
-        The method is tolerant of different shapes (DRF-style 'results'/'next' or direct lists).
+        The method is tolerant of different API response shapes (DRF-style 'results'/'next' or direct lists)
+        and converts raw document dicts into normalized `Document` instances with plaintext tags.
         """
         created_client = None
         client, created = await self._acquire_client(client)
         if created:
             created_client = client
+
+        await self._updateInternalMaps()
 
         docs: List[Dict[str, Any]] = []
         next_url = f"{self.base_url}/api/documents/"
@@ -100,16 +111,106 @@ class PaperlessClient:
                     logger.warning(f"Unexpected documents response shape: {type(page_results)}")
 
                 if limit and len(docs) >= limit:
-                    return docs[:limit]
+                    # We'll still collect up to limit (models created below)
+                    break
 
-                
                 if next_url := data.get("next"):
                     next_url = next_url.replace("http://","https://")
         finally:
             if created_client:
                 await created_client.aclose()
 
-        return docs
+        # Convert raw document dicts into Document models with plaintext tag names
+        try:
+            tags_map = await self.tags_name_map(client=client)
+        except Exception:
+            tags_map = {}
+
+        normalized: List[Document] = []
+        for d in docs:
+            try:
+
+                
+                # Extract tag-like fields from common locations
+                raw_tags = d.get("tags") or []
+                tag_names: List[str] = []
+                for t in raw_tags:
+                    try:
+                        if isinstance(t, str):
+                            tag_names.append(t)
+                        elif isinstance(t, dict):
+                            name = t.get("name") or t.get("title") or t.get("label")
+                            if name:
+                                tag_names.append(str(name))
+                            else:
+                                id_val = t.get("id") or t.get("pk")
+                                if id_val is not None:
+                                    mapped = tags_map.get(int(id_val))
+                                    if mapped:
+                                        tag_names.append(mapped)
+                        elif isinstance(t, int):
+                            mapped = tags_map.get(int(t))
+                            if mapped:
+                                tag_names.append(mapped)
+                        else:
+                            tag_names.append(str(t))
+                    except Exception:
+                        continue
+
+                # Deduplicate while preserving order
+                seen = set()
+                uniq_tags: List[str] = []
+                for x in tag_names:
+                    if x not in seen:
+                        seen.add(x)
+                        uniq_tags.append(x)
+
+                # Correspondent/document_type plain name extraction
+                def extract_name_field(val):
+                    if val is None:
+                        return None
+                    if isinstance(val, str):
+                        return val
+                    if isinstance(val, dict):
+                        return val.get("name") or val.get("title") or val.get("label")
+                    return None
+
+                correspondent_name = extract_name_field(d.get("correspondent"))
+                document_type_name = extract_name_field(d.get("document_type"))
+
+                # id may be 'id' or 'pk'
+                id_val = d.get("id") if isinstance(d, dict) else None
+                if id_val is None:
+                    id_val = d.get("pk") if isinstance(d, dict) else None
+
+                normalized_doc = Document.model_validate(
+                    {
+                        "id": id_val,
+                        "title": d.get("title"),
+                        "tags": uniq_tags,
+                        "correspondent": correspondent_name,
+                        "document_date": d.get("document_date") or d.get("date"),
+                        "document_type": document_type_name,
+                        "language": d.get("language"),
+                        "raw": d,
+                    }
+                )
+                normalized.append(normalized_doc)
+            except Exception:
+                # Skip malformed document entries but continue processing others
+                logger.exception(f"Failed to normalize document: {d}")
+                continue
+
+        if limit:
+            return normalized[:limit]
+        return normalized
+
+
+    async def parseDocumentData(response:List[Dict]):
+        pass
+
+
+
 
     async def fetch_document_bytes(
         self,
@@ -240,7 +341,9 @@ class PaperlessClient:
         Tries common tag endpoint paths.
         """
         endpoints = ["tags"]
-        return await self._fetch_list(client, endpoints, limit=limit)
+        tagsasjson =  await self._fetch_list(client, endpoints, limit=limit)
+        return [Tag(**tags) for tags in tagsasjson]
+
 
 
     async def list_document_types(
@@ -252,7 +355,8 @@ class PaperlessClient:
         Return a list of document type objects. Tries several common endpoint name variants.
         """
         endpoints = ["document_types"]
-        return await self._fetch_list(client, endpoints, limit=limit)
+        docTypesjson = await self._fetch_list(client, endpoints, limit=limit)
+        return [DocumentType(**doc) for doc in docTypesjson]
 
 
     async def list_correspondents(
@@ -264,7 +368,8 @@ class PaperlessClient:
         Return a list of correspondent/contact objects. Tries a few possible endpoint names.
         """
         endpoints = ["correspondents"]
-        return await self._fetch_list(client, endpoints, limit=limit)
+        correspondentjson = await self._fetch_list(client, endpoints, limit=limit)
+        return [Correspondent(**corr) for corr in correspondentjson]
 
 
     # Utilities to produce simplified id -> name maps and pretty-printed representations
@@ -646,3 +751,45 @@ class PaperlessClient:
         finally:
             if created_client:
                 await created_client.aclose()
+
+
+
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+    import yaml
+    import json
+    from loguru import logger
+    from typing import Optional, Dict, Any
+    from httpx import AsyncClient
+    import sys
+    import asyncio
+    # Load environment variables from a local .env file (if present)
+    load_dotenv()
+
+
+    # Configuration via ENV (kept same names for backward compatibility)
+    PAPERLESS_BASE_URL = os.getenv("PAPERLESS_BASE_URL")
+    PAPERLESS_API_TOKEN = os.getenv("PAPERLESS_API_TOKEN")
+
+    REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+
+    # Use loguru for structured logging
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="{time:YYYY-MM-DD HH:mm:ss} {level} {message}",
+    )
+
+    if not PAPERLESS_BASE_URL:
+        logger.error("Please set PAPERLESS_BASE_URL environment variable.")
+        sys.exit(1)
+    if not PAPERLESS_API_TOKEN:
+        logger.error("Please set PAPERLESS_API_TOKEN environment variable.")
+        sys.exit(1)
+ 
+
+    client = PaperlessClient(PAPERLESS_BASE_URL,PAPERLESS_API_TOKEN)
+    
+    docs = asyncio.run(client.list_documents(limit=2))
+    logger.info(f"{docs}")
