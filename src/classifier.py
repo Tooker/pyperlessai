@@ -10,7 +10,7 @@ from loguru import logger
 
 from paperless import PaperlessClient
 from ai_client import AIClient
-from schemas import DocumentMetadata
+from schemas import DocumentMetadata, Document
 
 
 class PaperlessOpenAIClassifier:
@@ -113,17 +113,36 @@ class PaperlessOpenAIClassifier:
             self._prefetch_task = None
 
     # Helper: extract tag IDs from a Paperless document representation (robust to various shapes)
-    def _extract_tag_ids_from_doc(self, doc: Dict[str, Any]) -> List[int]:
+    def _extract_tag_ids_from_doc(self, doc: "Document") -> List[int]:
         """
-        Inspect common places where Paperless document encodes tags and return a list of tag IDs.
-        Handles:
-         - integer IDs
-         - dicts with "id" or "name"
-         - string names (mapped via self.tags_map)
-        Returns a de-duplicated list of ints.
+        Inspect common places where a Document or its raw API response encodes tags and return a list of tag IDs.
+        Strategy:
+         - Prefer explicit integer ids found in the raw payload (id/pk fields).
+         - Map known tag names (strings) to ids using self.tags_map.
+         - Return de-duplicated list of ints.
         """
-        tags_field = doc.get("tags") or doc.get("tag_set") or doc.get("tag_ids") or []
         result: List[int] = []
+        # Try to inspect raw payload if available (preserves original id-based representations)
+        if isinstance(doc, dict):
+            raw = doc.get("raw", {}) or {}
+        else:
+            try:
+                raw = doc.raw or {}
+            except Exception:
+                raw = {}
+        tags_field = []
+        if isinstance(raw, dict):
+            tags_field = raw.get("tags") or raw.get("tag_set") or raw.get("tag_ids") or []
+        # If raw had no tag-like field, fall back to normalized name list on Document
+        if not tags_field:
+            if isinstance(doc, dict):
+                tags_field = doc.get("tags") or []
+            else:
+                try:
+                    tags_field = doc.tags or []
+                except Exception:
+                    tags_field = []
+
         for t in tags_field:
             try:
                 if isinstance(t, int):
@@ -131,6 +150,8 @@ class PaperlessOpenAIClassifier:
                 elif isinstance(t, dict):
                     if "id" in t and t["id"] is not None:
                         result.append(int(t["id"]))
+                    elif "pk" in t and t["pk"] is not None:
+                        result.append(int(t["pk"]))
                     elif "name" in t and t["name"]:
                         name = str(t["name"]).strip().casefold()
                         for k, v in self.tags_map.items():
@@ -138,14 +159,37 @@ class PaperlessOpenAIClassifier:
                                 result.append(k)
                                 break
                 elif isinstance(t, str):
+                    # try map by name
                     name = t.strip().casefold()
                     for k, v in self.tags_map.items():
                         if v and v.strip().casefold() == name:
                             result.append(k)
                             break
+                else:
+                    # unknown type; ignore
+                    continue
             except Exception:
-                # ignore malformed entries
                 continue
+
+        # Fallback: if nothing found but Document.tags contains names, map those too
+        if not result:
+            tag_names = []
+            if isinstance(doc, dict):
+                tag_names = doc.get("tags") or []
+            else:
+                try:
+                    tag_names = doc.tags or []
+                except Exception:
+                    tag_names = []
+            for name in tag_names:
+                try:
+                    target = str(name).strip().casefold()
+                    for k, v in self.tags_map.items():
+                        if v and v.strip().casefold() == target:
+                            result.append(k)
+                            break
+                except Exception:
+                    continue
 
         # preserve order and deduplicate
         seen = set()
@@ -156,12 +200,12 @@ class PaperlessOpenAIClassifier:
                 uniq.append(x)
         return uniq
 
-    def _doc_has_ai_processed_tag(self, doc: Dict[str, Any]) -> bool:
+    def _doc_has_ai_processed_tag(self, doc: "Document") -> bool:
         """
         Return True if the document already contains the AI_Processed tag.
-        Checks both resolved tag IDs (using tags_map) and raw tag name entries.
+        Checks both resolved tag IDs (using tags_map) and normalized tag name entries.
         """
-        ai_name = getattr(self, "ai_processed_tag_name", os.getenv("PAPERLESS_AI_PROCESSED_TAG", "AI_Processed"))
+        ai_name = self.ai_processed_tag_name or os.getenv("PAPERLESS_AI_PROCESSED_TAG", "AI_Processed")
         ai_name_cf = ai_name.casefold()
         ai_id = None
         # Try to find the tag id in the prefetched tags_map
@@ -174,19 +218,33 @@ class PaperlessOpenAIClassifier:
         if ai_id is not None and ai_id in tag_ids:
             return True
 
-        # Fallback: check raw tag name entries in the document
-        for t in doc.get("tags") or []:
+        # Fallback: check normalized tag names on Document
+        try:
+            if doc.has_ai_processed_tag(ai_name):
+                return True
+        except Exception:
+            pass
+
+        # Also check raw tag name entries if present
+        if isinstance(doc, dict):
+            raw = doc.get("raw", {}) or {}
+        else:
             try:
-                if isinstance(t, dict) and "name" in t and str(t["name"]).strip().casefold() == ai_name.casefold():
+                raw = doc.raw or {}
+            except Exception:
+                raw = {}
+        for t in (raw.get("tags") or []):
+            try:
+                if isinstance(t, dict) and "name" in t and str(t["name"]).strip().casefold() == ai_name_cf:
                     return True
-                if isinstance(t, str) and t.strip().casefold() == ai_name.casefold():
+                if isinstance(t, str) and t.strip().casefold() == ai_name_cf:
                     return True
             except Exception:
                 continue
 
         return False
 
-    async def _add_ai_processed_tag(self, doc_id: int, doc: Dict[str, Any]) -> None:
+    async def _add_ai_processed_tag(self, doc_id: int, doc: "Document") -> None:
         """
         Ensure the AI_Processed tag exists and append it to the document's tags (without removing existing tags).
         Uses PaperlessClient.get_or_create_tag and update_document.
@@ -244,9 +302,9 @@ class PaperlessOpenAIClassifier:
         finally:
             await self.paperless.__aexit__(exc_type, exc, tb)
 
-    async def list_documents(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    async def list_documents(self, limit: Optional[int] = None) -> List[Document]:
         """
-        Convenience wrapper that delegates to the internal PaperlessClient.
+        Convenience wrapper that delegates to the internal PaperlessClient and returns Document models.
         """
         return await self.paperless.list_documents(limit=limit)
 
@@ -330,7 +388,7 @@ class PaperlessOpenAIClassifier:
         try:
             # Common SDK/dict locations
             if hasattr(result, "output_parsed"):
-                parsed_obj = getattr(result, "output_parsed")
+                parsed_obj = result.output_parsed
             elif isinstance(result, dict) and "output_parsed" in result:
                 parsed_obj = result["output_parsed"]
         except Exception:
@@ -386,6 +444,7 @@ class PaperlessOpenAIClassifier:
         self,
         doc_id: int,
         extra_instructions: Optional[str] = None,
+        doc: Optional["Document"] = None,
     ) -> AnyType:
         """
         Fetch a document from Paperless by id, then analyze it.
@@ -415,7 +474,7 @@ class PaperlessOpenAIClassifier:
     async def _process_document(
         self,
         semaphore: asyncio.Semaphore,
-        doc: Dict[str, Any],
+        doc: "Document",
         out_dir: str = "poc_output",
     ) -> None:
         """
@@ -424,8 +483,18 @@ class PaperlessOpenAIClassifier:
         and writes JSON output files under out_dir.
         """
         async with semaphore:
-            doc_id = doc.get("id")
-            title = doc.get("title") or "<untitled>"
+            if isinstance(doc, dict):
+                doc_id = doc.get("id")
+                title = doc.get("title") or "<untitled>"
+            else:
+                try:
+                    doc_id = doc.id
+                except Exception:
+                    doc_id = None
+                try:
+                    title = doc.title or "<untitled>"
+                except Exception:
+                    title = "<untitled>"
             logger.info(f"Processing doc id={doc_id} title={title}")
             if not doc_id:
                 logger.warning(f"No id found on document: {doc}")
@@ -442,7 +511,7 @@ class PaperlessOpenAIClassifier:
 
         logger.info(f"Analyzing Paperless document id={doc_id} with classifier")
         try:
-            result = await self.analyze_paperless_document(doc_id, extra_instructions=None)
+            result = await self.analyze_paperless_document(doc_id, extra_instructions=None, doc=doc)
 
             # # Convert result to JSON for logging/saving in a robust way that handles SDK objects or dicts.
             # raw_json = ""

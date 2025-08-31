@@ -62,30 +62,40 @@ if not OPENAI_API_KEY:
 # Import refactored clients
 from ai_client import AIClient
 from classifier import PaperlessOpenAIClassifier
+from schemas import Document
 
 
 async def process_document(
     semaphore: asyncio.Semaphore,
     ai: AIClient,
     classifier: PaperlessOpenAIClassifier,
-    doc: Dict[str, Any],
-    max_image_size: int,
+    doc: Document,
     out_dir: str = "poc_output",
 ):
-    async with semaphore:
-        doc_id = doc.get("id") or doc.get("pk") or doc.get("document_id")
-        title = doc.get("title") or doc.get("name") or "<untitled>"
-        logger.info(f"Processing doc id={doc_id} title={title}")
-        if not doc_id:
-            logger.warning(f"No id found on document: {doc}")
-            return
+        async with semaphore:
+            if isinstance(doc, dict):
+                doc_id = doc.get("id")
+                title = doc.get("title") or "<untitled>"
+            else:
+                try:
+                    doc_id = doc.id
+                except Exception:
+                    doc_id = None
+                try:
+                    title = doc.title or "<untitled>"
+                except Exception:
+                    title = "<untitled>"
+            logger.info(f"Processing doc id={doc_id} title={title}")
+            if not doc_id:
+                logger.warning(f"No id found on document: {doc}")
+                return
 
         os.makedirs(out_dir, exist_ok=True)
 
         logger.info(f"Analyzing Paperless document id={doc_id} with classifier")
         try:
             # Classifier now handles fetching the document bytes via the provided PaperlessClient.
-            result = await classifier.analyze_paperless_document(doc_id, extra_instructions=None)
+            result = await classifier.analyze_paperless_document(doc, extra_instructions=None, doc=doc)
 
             # Convert result to JSON for logging/saving in a robust way that handles SDK objects or dicts.
             raw_json = ""

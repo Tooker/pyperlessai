@@ -1,5 +1,5 @@
 import os
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Union
 
 import httpx
 from loguru import logger
@@ -69,8 +69,6 @@ class PaperlessClient:
         self._tags = await self.list_tags()
         self._docTypes = await self.list_document_types()
         self._correspondents = await self.list_correspondents()
-
-        logger.info(self._correspondents)
         pass
 
     async def list_documents(
@@ -119,80 +117,93 @@ class PaperlessClient:
         finally:
             if created_client:
                 await created_client.aclose()
+        docs = await self._parseDocumentData(docs[:limit])
 
-        # Convert raw document dicts into Document models with plaintext tag names
+        return docs
+
+    def _findIdInList(self, id_value: Union[int, str, Dict[str, Any]], listOf: Union[List[Tag], List[DocumentType], List[Correspondent]]) -> Optional[str]:
+        """
+        Given an id-like value or name and a list of Tag/DocumentType/Correspondent objects,
+        return the human-readable name if found, otherwise None.
+
+        Accepts:
+          - int -> match by item.id
+          - str -> either numeric id string or name; try id first then name (case-insensitive)
+          - dict -> extract 'id' or 'pk' (or 'name'/'title'/'label') then match
+        """
         try:
-            tags_map = await self.tags_name_map(client=client)
-        except Exception:
-            tags_map = {}
+            if id_value is None:
+                return None
 
-        normalized: List[Document] = []
-        for d in docs:
+            # If a dict-like object was passed, try to extract an id or a name
+            if isinstance(id_value, dict):
+                id_candidate = id_value.get("id") or id_value.get("pk")
+                if id_candidate is not None:
+                    id_value = id_candidate
+                else:
+                    # fallback to name-like fields
+                    name_candidate = id_value.get("name") or id_value.get("title") or id_value.get("label")
+                    return str(name_candidate).strip() if name_candidate else None
+
+            # Try to interpret as an integer id first
             try:
-
-                
-                # Extract tag-like fields from common locations
-                raw_tags = d.get("tags") or []
-                tag_names: List[str] = []
-                for t in raw_tags:
+                iv = int(id_value)
+            except Exception:
+                # Treat as a name; try to match case-insensitively against known items
+                target = str(id_value).strip().casefold()
+                for item in listOf or []:
                     try:
-                        if isinstance(t, str):
-                            tag_names.append(t)
-                        elif isinstance(t, dict):
-                            name = t.get("name") or t.get("title") or t.get("label")
-                            if name:
-                                tag_names.append(str(name))
-                            else:
-                                id_val = t.get("id") or t.get("pk")
-                                if id_val is not None:
-                                    mapped = tags_map.get(int(id_val))
-                                    if mapped:
-                                        tag_names.append(mapped)
-                        elif isinstance(t, int):
-                            mapped = tags_map.get(int(t))
-                            if mapped:
-                                tag_names.append(mapped)
-                        else:
-                            tag_names.append(str(t))
+                        nm = getattr(item, "name", None)
+                        if nm and nm.strip().casefold() == target:
+                            return nm
                     except Exception:
                         continue
+                # No exact match found; return the original string value (trimmed)
+                return str(id_value).strip()
+            else:
+                # Match integer id against items' id attribute
+                for item in listOf or []:
+                    try:
+                        if getattr(item, "id", None) == iv:
+                            return getattr(item, "name", None)
+                    except Exception:
+                        continue
+                return None
+        except Exception:
+            return None
 
-                # Deduplicate while preserving order
-                seen = set()
-                uniq_tags: List[str] = []
-                for x in tag_names:
-                    if x not in seen:
-                        seen.add(x)
-                        uniq_tags.append(x)
 
-                # Correspondent/document_type plain name extraction
-                def extract_name_field(val):
-                    if val is None:
-                        return None
-                    if isinstance(val, str):
-                        return val
-                    if isinstance(val, dict):
-                        return val.get("name") or val.get("title") or val.get("label")
-                    return None
+    async def _parseDocumentData(self, response:List[Dict]):
 
-                correspondent_name = extract_name_field(d.get("correspondent"))
-                document_type_name = extract_name_field(d.get("document_type"))
+        self._updateInternalMaps()
+          # Convert raw document dicts into Document models with plaintext tag names
+       
 
-                # id may be 'id' or 'pk'
-                id_val = d.get("id") if isinstance(d, dict) else None
-                if id_val is None:
-                    id_val = d.get("pk") if isinstance(d, dict) else None
+        normalized: List[Document] = []
+        for d in response:
+            try:
+
+              
+                # Extract tag-like fields from common locations
+                raw_tags = d.get("tags") or []
+                tag_names: List[str] = [ self._findIdInList(raw,self._tags) for raw in raw_tags]
+                correspondent_name = self._findIdInList(d.get("correspondent"),self._correspondents)
+                document_type_name = self._findIdInList(d.get("document_type"),self._docTypes)
+                pdfData = await self.fetch_document_bytes(None,doc_id=d.get("id"))
+
+                
 
                 normalized_doc = Document.model_validate(
                     {
-                        "id": id_val,
+                        "id": d.get("id"),
                         "title": d.get("title"),
-                        "tags": uniq_tags,
+                        "tags": tag_names,
                         "correspondent": correspondent_name,
                         "document_date": d.get("document_date") or d.get("date"),
                         "document_type": document_type_name,
                         "language": d.get("language"),
                         "raw": d,
+                        "pdfdata": pdfData
                     }
                 )
                 normalized.append(normalized_doc)
@@ -201,13 +212,8 @@ class PaperlessClient:
                 logger.exception(f"Failed to normalize document: {d}")
                 continue
 
-        if limit:
-            return normalized[:limit]
+        
         return normalized
-
-
-    async def parseDocumentData(response:List[Dict]):
-        pass
 
 
 

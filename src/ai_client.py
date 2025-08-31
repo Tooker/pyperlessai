@@ -150,11 +150,17 @@ class AIClient:
                     uploaded = openai.File.create(file=f, filename="document.pdf", purpose="user_data")
 
                 # Extract file id
-                fid = (
-                    getattr(uploaded, "id", None)
-                    or getattr(uploaded, "file_id", None)
-                    or (uploaded.get("id") if isinstance(uploaded, dict) else None)
-                )
+                fid = None
+                if isinstance(uploaded, dict):
+                    fid = uploaded.get("id") or uploaded.get("file_id")
+                else:
+                    try:
+                        fid = uploaded.id
+                    except Exception:
+                        try:
+                            fid = uploaded.file_id
+                        except Exception:
+                            fid = None
                 if not fid:
                     raise RuntimeError("Failed to obtain uploaded file id from SDK response")
                 nonlocal_file_id = fid  # just for readability
@@ -220,7 +226,10 @@ class AIClient:
         if isinstance(response, dict):
             file_id = response.get("_uploaded_file_id")
         else:
-            file_id = getattr(response, "_uploaded_file_id", None)
+            try:
+                file_id = response._uploaded_file_id
+            except Exception:
+                file_id = None
 
         # Delete uploaded file in background thread if we have an id
         async def _cleanup(fid: str):

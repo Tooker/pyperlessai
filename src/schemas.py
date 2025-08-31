@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional, List, Dict, Any
 from datetime import date
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, validator, ConfigDict, Field
 
 
 class DocumentMetadata(BaseModel):
@@ -79,12 +79,13 @@ class Document(BaseModel):
     correspondent: Optional[str]
     document_date: Optional[date]
     document_type: Optional[str]
-    language: Optional[str]
-    raw: Optional[Dict[str, Any]] = None
+    language: Optional[str] = Field(repr=False)
+    pdfdata: Optional[bytes] = Field(repr=False) 
+    raw: Optional[Dict[str, Any]] = Field(repr=False)
 
     class Config:
         # Paperless API responses vary between installations; allow extra fields.
-        extra = "allow"
+        extra = "forbid"
         anystr_strip_whitespace = True
         schema_extra = {
             "example": {
@@ -98,6 +99,9 @@ class Document(BaseModel):
             }
         }
 
+    def __repr__(self):
+        return super().__repr__()
+    
     @validator("tags", pre=True, always=True)
     def normalize_tags(cls, v):
         """
