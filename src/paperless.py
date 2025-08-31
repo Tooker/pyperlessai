@@ -175,7 +175,7 @@ class PaperlessClient:
 
     async def _parseDocumentData(self, response:List[Dict]):
 
-        self._updateInternalMaps()
+        await self._updateInternalMaps()
           # Convert raw document dicts into Document models with plaintext tag names
        
 
@@ -350,8 +350,23 @@ class PaperlessClient:
         tagsasjson =  await self._fetch_list(client, endpoints, limit=limit)
         return [Tag(**tags) for tags in tagsasjson]
 
+    def extract_nameFromList(self,listToExtract:Union[List[Tag], List[DocumentType], List[Correspondent]]):
 
+        names = []
+        for item in listToExtract:
+            names.append(item.name)
+        return names
 
+    async def list_tag_names(self):
+
+        return self.extract_nameFromList(await self.list_tags())
+
+    async def list_document_types_names(self):
+        return self.extract_nameFromList(await self.list_document_types())
+    
+    async def list_correspondents_names(self):
+        return self.extract_nameFromList(await self.list_correspondents())
+    
     async def list_document_types(
         self,
         client: Optional[httpx.AsyncClient] = None,
@@ -376,104 +391,6 @@ class PaperlessClient:
         endpoints = ["correspondents"]
         correspondentjson = await self._fetch_list(client, endpoints, limit=limit)
         return [Correspondent(**corr) for corr in correspondentjson]
-
-
-    # Utilities to produce simplified id -> name maps and pretty-printed representations
-    def _name_map_from_items(self, items: List[Dict[str, Any]]) -> Dict[int, str]:
-        """
-        Build a mapping of item id -> item name from a list of dict-like items.
-
-        This helper is more tolerant about variations in API responses: some Paperless
-        deployments return 'id', others 'pk'. Likewise the name field may be 'name'
-        or 'title'. Accept both forms and skip malformed entries.
-        """
-        result: Dict[int, str] = {}
-        for item in items:
-            try:
-                id_val = item.get("id") if isinstance(item, dict) else None
-                if id_val is None:
-                    id_val = item.get("pk") if isinstance(item, dict) else None
-
-                # Accept a few possible name fields
-                name_val = None
-                if isinstance(item, dict):
-                    name_val = item.get("name") or item.get("title") or item.get("label")
-
-                if id_val is not None and name_val is not None:
-                    try:
-                        result[int(id_val)] = name_val
-                    except Exception:
-                        # skip items with non-int ids
-                        continue
-            except Exception:
-                # Ignore malformed items
-                continue
-        # keep deterministic ordering by id
-        return dict(sorted(result.items()))
-
-    def _pretty_from_map(self, m: Dict[int, str]) -> str:
-        """
-        Return a stable, newline-separated pretty string for a mapping of id -> name.
-        Sorted by id for determinism.
-        """
-        return "\n".join(f"{k}: {v}" for k, v in sorted(m.items()))
-
-    async def tags_name_map(self, client: Optional[httpx.AsyncClient] = None) -> Dict[int, str]:
-        """
-        Return a simplified mapping of tag id -> tag name.
-        """
-        try:
-            items = await self.list_tags(client=client)
-            result = self._name_map_from_items(items)
-            # Ensure deterministic ordering by id
-            return dict(sorted(result.items()))
-        except Exception as e:
-            logger.exception("Failed to fetch tags: %s", e)
-            return {}
-
-    async def tags_pretty(self, client: Optional[httpx.AsyncClient] = None) -> str:
-        """
-        Return a pretty-printed string of tag id -> name pairs (one per line).
-        """
-        return self._pretty_from_map(await self.tags_name_map(client=client))
-
-    async def document_types_name_map(self, client: Optional[httpx.AsyncClient] = None) -> Dict[int, str]:
-        """
-        Return a simplified mapping of document type id -> document type name.
-        """
-        try:
-            items = await self.list_document_types(client=client)
-            result = self._name_map_from_items(items)
-            # Ensure deterministic ordering by id
-            return dict(sorted(result.items()))
-        except Exception as e:
-            logger.exception("Failed to fetch document types: %s", e)
-            return {}
-
-    async def document_types_pretty(self, client: Optional[httpx.AsyncClient] = None) -> str:
-        """
-        Return a pretty-printed string of document type id -> name pairs (one per line).
-        """
-        return self._pretty_from_map(await self.document_types_name_map(client=client))
-
-    async def correspondents_name_map(self, client: Optional[httpx.AsyncClient] = None) -> Dict[int, str]:
-        """
-        Return a simplified mapping of correspondent id -> correspondent name.
-        """
-        try:
-            items = await self.list_correspondents(client=client)
-            result = self._name_map_from_items(items)
-            # Ensure deterministic ordering by id
-            return dict(sorted(result.items()))
-        except Exception as e:
-            logger.exception("Failed to fetch correspondents: %s", e)
-            return {}
-
-    async def correspondents_pretty(self, client: Optional[httpx.AsyncClient] = None) -> str:
-        """
-        Return a pretty-printed string of correspondent id -> name pairs (one per line).
-        """
-        return self._pretty_from_map(await self.correspondents_name_map(client=client))
 
 
     async def create_tag(self, name: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:

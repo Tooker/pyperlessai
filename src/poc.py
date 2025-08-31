@@ -65,74 +65,7 @@ from classifier import PaperlessOpenAIClassifier
 from schemas import Document
 
 
-async def process_document(
-    semaphore: asyncio.Semaphore,
-    ai: AIClient,
-    classifier: PaperlessOpenAIClassifier,
-    doc: Document,
-    out_dir: str = "poc_output",
-):
-        async with semaphore:
-            if isinstance(doc, dict):
-                doc_id = doc.get("id")
-                title = doc.get("title") or "<untitled>"
-            else:
-                try:
-                    doc_id = doc.id
-                except Exception:
-                    doc_id = None
-                try:
-                    title = doc.title or "<untitled>"
-                except Exception:
-                    title = "<untitled>"
-            logger.info(f"Processing doc id={doc_id} title={title}")
-            if not doc_id:
-                logger.warning(f"No id found on document: {doc}")
-                return
 
-        os.makedirs(out_dir, exist_ok=True)
-
-        logger.info(f"Analyzing Paperless document id={doc_id} with classifier")
-        try:
-            # Classifier now handles fetching the document bytes via the provided PaperlessClient.
-            result = await classifier.analyze_paperless_document(doc, extra_instructions=None, doc=doc)
-
-            # Convert result to JSON for logging/saving in a robust way that handles SDK objects or dicts.
-            raw_json = ""
-            try:
-                if hasattr(result, "model_dump_json"):
-                    raw_json = result.model_dump_json(indent=2)
-                else:
-                    raw_json = json.dumps(result, ensure_ascii=False, indent=2)
-            except Exception:
-                try:
-                    raw_json = json.dumps({"raw": str(result)}, ensure_ascii=False, indent=2)
-                except Exception:
-                    raw_json = str(result)
-
-            json_out = os.path.join(out_dir, f"{doc_id}.openai.json")
-            json_parsed_out = os.path.join(out_dir, f"{doc_id}.openai_parsed.json")
-
-            with open(json_out, "w", encoding="utf-8") as jf:
-                jf.write(raw_json)
-
-            # Attempt to save parsed output if available on the SDK object or dict
-            try:
-                if hasattr(result, "output_parsed"):
-                    parsed_json = result.output_parsed.model_dump_json(indent=2)
-                    with open(json_parsed_out, "w", encoding="utf-8") as parsed:
-                        parsed.write(parsed_json)
-                elif isinstance(result, dict) and "output_parsed" in result:
-                    with open(json_parsed_out, "w", encoding="utf-8") as parsed:
-                        parsed.write(json.dumps(result["output_parsed"], ensure_ascii=False, indent=2))
-            except Exception:
-                # Ignore parsing save errors; main result is already saved.
-                pass
-
-            logger.info(f"Saved OpenAI JSON result to {json_out}")
-        except Exception as e:
-            logger.exception("Failed to call classifier for doc %s: %s", doc_id, e)
-        return
 
 
 async def main(limit: int = 10):

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, List, Any as AnyType
+from typing import Optional, Dict, Any, List, Any as AnyType, Tuple
 import asyncio
 import json
 import os
 from pathlib import Path
-
+from copy import deepcopy
 from loguru import logger
 
 from paperless import PaperlessClient
@@ -94,12 +94,12 @@ class PaperlessOpenAIClassifier:
             # Delegate error handling to PaperlessClient; its name-map helpers
             # will return empty dicts and log failures. Keep a top-level catch
             # for any unexpected errors during prefetch.
-            self.tags_map = await self.paperless.tags_name_map()
-            self.document_types_map = await self.paperless.document_types_name_map()
-            self.correspondents_map = await self.paperless.correspondents_name_map()
+            self.tags = await self.paperless.list_tag_names()
+            self.document_types = await self.paperless.list_document_types_names()
+            self.correspondents = await self.paperless.list_correspondents_names()
 
 
-            logger.info(f"Prefetch complete: {len(self.tags_map)} tags, {len(self.document_types_map)} document types, {len(self.correspondents_map)} correspondents")
+            logger.info(f"Prefetch complete: {len(self.tags)} tags, {len(self.document_types)} document types, {len(self.correspondents)} correspondents")
         except Exception as e:
             logger.exception(f"Unexpected error during prefetch: {e}")
 
@@ -361,8 +361,7 @@ class PaperlessOpenAIClassifier:
         self,
         pdf_bytes: bytes,
         extra_instructions: Optional[str] = None,
-        paperless_doc_id: Optional[int] = None,
-    ) -> AnyType:
+    ) -> DocumentMetadata:
         """
         Send the provided PDF to OpenAI using AIClient, with a prompt that
         includes grounded context (tags, correspondents, document types).
@@ -375,77 +374,27 @@ class PaperlessOpenAIClassifier:
         Returns the raw response from AIClient.send_pdf_bytes (SDK object or dict).
         """
         # Refresh only tags so the grounded prompt uses the latest tag names
-        try:
-            self.tags_map = await self.paperless.tags_name_map()
-        except Exception:
-            logger.warning("Failed to refresh tags before sending PDF to OpenAI; proceeding with cached tags")
+        await self._prefetch()
         prompt_text = self.build_prompt(extra_instructions=extra_instructions)
         logger.debug("Sending PDF to OpenAI with grounded context (tags, correspondents, document types).")
         result = await self.ai.send_pdf_bytes(pdf_bytes, prompt_text)
 
         # Attempt to extract parsed output that matches DocumentMetadata
-        parsed_obj = None
+       
         try:
             # Common SDK/dict locations
             if hasattr(result, "output_parsed"):
-                parsed_obj = result.output_parsed
-            elif isinstance(result, dict) and "output_parsed" in result:
-                parsed_obj = result["output_parsed"]
+                return result.output_parsed
         except Exception:
-            parsed_obj = None
+            return None
 
-        # If we found something that looks like parsed output, try to coerce into the Pydantic model.
-        metadata: Optional[DocumentMetadata] = None
-        if parsed_obj is not None:
-            try:
-                # If parsed_obj is a JSON/string, try to load it
-                if isinstance(parsed_obj, str):
-                    try:
-                        parsed_dict = json.loads(parsed_obj)
-                    except Exception:
-                        parsed_dict = None
-                elif isinstance(parsed_obj, dict):
-                    parsed_dict = parsed_obj
-                else:
-                    # Fallback: try to call model_dump or convert to dict
-                    try:
-                        parsed_dict = parsed_obj.model_dump()  # type: ignore[attr-defined]
-                    except Exception:
-                        parsed_dict = None
-
-                if parsed_dict is not None:
-                    metadata = DocumentMetadata.model_validate(parsed_dict)
-            except Exception as e:
-                logger.warning(f"Failed to parse AI output into DocumentMetadata: {e}")
-                metadata = None
-
-        # If we didn't get structured metadata, nothing more to do — return raw result.
-        if metadata is None:
-            logger.info("No structured metadata found in AI response; returning raw result.")
-            return result
-
-        # Ensure we have the latest name maps
-        await self.ensure_prefetched()
-
-        # Delegate creation/lookup and payload construction to PaperlessClient
-        if paperless_doc_id is not None:
-            try:
-                updated = await self.paperless.update_document_from_metadata(paperless_doc_id, metadata)
-                if updated:
-                    logger.info(f"Updated Paperless document id={paperless_doc_id} from metadata")
-                else:
-                    logger.warning(f"Paperless update returned no result for id={paperless_doc_id}")
-            except Exception as e:
-                logger.warning(f"Failed to update Paperless document id={paperless_doc_id}: {e}")
-
-        return result
 
     async def analyze_paperless_document(
         self,
-        doc_id: int,
+        doc: Document,
         extra_instructions: Optional[str] = None,
-        doc: Optional["Document"] = None,
-    ) -> AnyType:
+        
+    ) -> Tuple[Document,bool]:
         """
         Fetch a document from Paperless by id, then analyze it.
         - If it's a PDF, upload to OpenAI with grounded prompt.
@@ -455,26 +404,25 @@ class PaperlessOpenAIClassifier:
         to ensure grounded lists are available.
         """
         # Wait for prefetch to finish if it's in progress
-        await self.ensure_prefetched()
+        localDoc = deepcopy(doc)
+        
+        result =  await self.analyze_pdf(localDoc.pdfdata, extra_instructions=extra_instructions)
+        updateNeeded = result.correspondent !=  localDoc.correspondent or result.tags != localDoc.tags or result.title != localDoc.title or localDoc.document_type != result.document_type or localDoc.document_date != result.document_date
+        
+        #update doc
+        if updateNeeded:
+            localDoc.title = result.title
+            localDoc.correspondent = result.correspondent
+            localDoc.tags = result.tags
+            localDoc.document_type = result.document_type
+            localDoc.document_date = result.document_date
 
-        content = await self.paperless.fetch_document_bytes(None, doc_id)
-        if not content:
-            raise ValueError(f"No content returned for Paperless document id={doc_id}")
-
-        if content.startswith(b"%PDF"):
-            return await self.analyze_pdf(content, extra_instructions=extra_instructions, paperless_doc_id=doc_id)
-
-        try:
-            self.tags_map = await self.paperless.tags_name_map()
-        except Exception:
-            logger.warning("Failed to refresh tags before sending image to OpenAI; proceeding with cached tags")
-        logger.info("Sending image bytes to AI vision endpoint.")
-        return await self.ai.send_image_bytes(content, self.build_prompt(extra_instructions=extra_instructions))
+        return localDoc,updateNeeded
 
     async def _process_document(
         self,
         semaphore: asyncio.Semaphore,
-        doc: "Document",
+        doc: Document,
         out_dir: str = "poc_output",
     ) -> None:
         """
@@ -483,75 +431,23 @@ class PaperlessOpenAIClassifier:
         and writes JSON output files under out_dir.
         """
         async with semaphore:
-            if isinstance(doc, dict):
-                doc_id = doc.get("id")
-                title = doc.get("title") or "<untitled>"
-            else:
-                try:
-                    doc_id = doc.id
-                except Exception:
-                    doc_id = None
-                try:
-                    title = doc.title or "<untitled>"
-                except Exception:
-                    title = "<untitled>"
-            logger.info(f"Processing doc id={doc_id} title={title}")
-            if not doc_id:
-                logger.warning(f"No id found on document: {doc}")
-                return
-
-            # Ensure prefetched maps are available before checking tags
-            await self.ensure_prefetched()
+           
+            logger.info(f"Processing doc id={doc.id} title={doc.title}")
+           
             # If document already processed (has AI_Processed tag), skip it
-            if self._doc_has_ai_processed_tag(doc):
-                logger.info(f"Skipping doc id={doc_id} because it already has AI_Processed tag")
-                return
+            if doc.has_ai_processed_tag:
+                logger.info(f"Skipping doc title={doc.title} id={doc.id} because it already has AI_Processed tag")
+                #return
 
             os.makedirs(out_dir, exist_ok=True)
 
-        logger.info(f"Analyzing Paperless document id={doc_id} with classifier")
+        logger.info(f"Analyzing Paperless document Title={doc.title} with classifier")
         try:
-            result = await self.analyze_paperless_document(doc_id, extra_instructions=None, doc=doc)
+            newdoc, updateNeeded = await self.analyze_paperless_document(extra_instructions=None, doc=doc)
+            logger.info(newdoc)
+            logger.info(doc)
 
-            # # Convert result to JSON for logging/saving in a robust way that handles SDK objects or dicts.
-            # raw_json = ""
-            # try:
-            #     if hasattr(result, "model_dump_json"):
-            #         raw_json = result.model_dump_json(indent=2)
-            #     else:
-            #         raw_json = json.dumps(result, ensure_ascii=False, indent=2)
-            # except Exception:
-            #     try:
-            #         raw_json = json.dumps({"raw": str(result)}, ensure_ascii=False, indent=2)
-            #     except Exception:
-            #         raw_json = str(result)
-
-            # json_out = os.path.join(out_dir, f"{doc_id}.openai.json")
-            # json_parsed_out = os.path.join(out_dir, f"{doc_id}.openai_parsed.json")
-
-            # with open(json_out, "w", encoding="utf-8") as jf:
-            #     jf.write(raw_json)
-
-            # # Attempt to save parsed output if available on the SDK object or dict
-            # try:
-            #     if hasattr(result, "output_parsed"):
-            #         parsed_json = result.output_parsed.model_dump_json(indent=2)
-            #         with open(json_parsed_out, "w", encoding="utf-8") as parsed:
-            #             parsed.write(parsed_json)
-            #     elif isinstance(result, dict) and "output_parsed" in result:
-            #         with open(json_parsed_out, "w", encoding="utf-8") as parsed:
-            #             parsed.write(json.dumps(result["output_parsed"], ensure_ascii=False, indent=2))
-            # except Exception:
-            #     # Ignore parsing save errors; main result is already saved.
-            #     pass
-
-            # After successful processing, attempt to add the AI_Processed tag to the Paperless document.
-            try:
-                await self._add_ai_processed_tag(doc_id, doc)
-            except Exception:
-                # _add_ai_processed_tag logs its own errors; don't let tagging failures interrupt the main flow.
-                pass
-
+            
         except Exception as e:
             logger.exception(f"Failed to call classifier for doc {doc_id}: {e}")
         return
