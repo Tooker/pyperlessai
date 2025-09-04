@@ -75,7 +75,7 @@ class PaperlessClient:
     async def list_documents(
         self,
         client: Optional[httpx.AsyncClient] = None,
-        limit: Optional[int] = None,
+        limit: int = None
     ) -> List[Document]:
         """
         Return a list of Document models (normalized). Accepts an existing httpx.AsyncClient
@@ -91,14 +91,20 @@ class PaperlessClient:
             created_client = client
 
         await self._updateInternalMaps()
+        AIProcessedTag = await self.get_or_create_tag(os.getenv("PAPERLESS_AI_PROCESSED_TAG"))
 
         docs: List[Dict[str, Any]] = []
         next_url = f"{self.base_url}/api/documents/"
-
+        firstReq = await client.get(next_url,params={"tags__id__none":AIProcessedTag,"page_size":1})
+        firstReq.raise_for_status()
+        data = firstReq.json()
+        count = data["count"]
+        if count == 0:
+            return []
         try:
             while next_url:
                 logger.info(f"Fetching documents page: {next_url}")
-                resp = await client.get(next_url)
+                resp = await client.get(next_url,params={"tags__id__none":AIProcessedTag,"page_size":count})
                 resp.raise_for_status()
                 data = resp.json()
                 page_results = data.get("results") or data.get("data") or data
@@ -109,9 +115,6 @@ class PaperlessClient:
                 else:
                     logger.warning(f"Unexpected documents response shape: {type(page_results)}")
 
-                if limit and len(docs) >= limit:
-                    # We'll still collect up to limit (models created below)
-                    break
 
                 if next_url := data.get("next"):
                     next_url = next_url.replace("http://","https://")
@@ -349,6 +352,11 @@ class PaperlessClient:
         """
         endpoints = ["tags"]
         tagsasjson =  await self._fetch_list(client, endpoints, limit=limit)
+        try:
+            if tagsasjson[0]["count"] == 0:
+                return []
+        except Exception as e:
+            pass
         return [Tag(**tags) for tags in tagsasjson]
 
     def extract_nameFromList(self,listToExtract:Union[List[Tag], List[DocumentType], List[Correspondent]]):
@@ -378,6 +386,11 @@ class PaperlessClient:
         """
         endpoints = ["document_types"]
         docTypesjson = await self._fetch_list(client, endpoints, limit=limit)
+        try:
+            if docTypesjson[0]["count"] == 0:
+                return []
+        except Exception as e:
+            pass
         return [DocumentType(**doc) for doc in docTypesjson]
 
 
@@ -391,6 +404,11 @@ class PaperlessClient:
         """
         endpoints = ["correspondents"]
         correspondentjson = await self._fetch_list(client, endpoints, limit=limit)
+        try:
+            if correspondentjson[0]["count"] == 0:
+                return []
+        except Exception as e:
+            pass
         return [Correspondent(**corr) for corr in correspondentjson]
 
 

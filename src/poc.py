@@ -38,7 +38,7 @@ PAPERLESS_API_TOKEN = os.getenv("PAPERLESS_API_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGESize".upper(), os.getenv("MAX_IMAGE_SIZE", "1024")))  # px
-CONCURRENT_WORKERS = int(os.getenv("CONCURRENT_WORKERS", "4"))
+CONCURRENT_WORKERS = int(os.getenv("CONCURRENT_WORKERS", "1"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 
 # Use loguru for structured logging
