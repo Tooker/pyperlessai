@@ -11,7 +11,10 @@ from loguru import logger
 from paperless import PaperlessClient
 from ai_client import AIClient
 from schemas import DocumentMetadata, Document
+from dotenv import load_dotenv
+load_dotenv()
 
+PROCESSED_TAG = os.getenv("PAPERLESS_AI_PROCESSED_TAG")
 
 class PaperlessOpenAIClassifier:
     """
@@ -433,9 +436,9 @@ class PaperlessOpenAIClassifier:
         async with semaphore:
            
             logger.info(f"Processing doc id={doc.id} title={doc.title}")
-           
+            
             # If document already processed (has AI_Processed tag), skip it
-            if doc.has_ai_processed_tag:
+            if doc.has_ai_processed_tag(PROCESSED_TAG):
                 logger.info(f"Skipping doc title={doc.title} id={doc.id} because it already has AI_Processed tag")
                 #return
 
@@ -444,8 +447,13 @@ class PaperlessOpenAIClassifier:
         logger.info(f"Analyzing Paperless document Title={doc.title} with classifier")
         try:
             newdoc, updateNeeded = await self.analyze_paperless_document(extra_instructions=None, doc=doc)
-            logger.info(newdoc)
-            logger.info(doc)
+            if updateNeeded:
+                logger.info(newdoc)
+                logger.info(doc)
+                if PROCESSED_TAG not in newdoc.tags:
+                    newdoc.tags.append(PROCESSED_TAG)
+                
+                await self.paperless.update_document_from_model(newdoc)
 
             
         except Exception as e:

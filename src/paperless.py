@@ -2,6 +2,7 @@ import os
 from typing import Optional, List, Dict, Any, Tuple, Union
 
 import httpx
+import asyncio
 from loguru import logger
 from schemas import DocumentMetadata, Document, Tag, DocumentType, Correspondent
 
@@ -526,18 +527,20 @@ class PaperlessClient:
             return None
         try:
             # try to find existing correspondent by name (case-insensitive)
-            name_map = await self.correspondents_name_map(client=client)
-            target = name.strip().casefold()
-            for k, v in name_map.items():
-                if v and v.strip().casefold() == target:
-                    return k
+            name_map = await self.list_correspondents(client=client)
+            corro = list(filter(lambda x: x.name == name,name_map))
+            if len(corro) >1:
+                raise RuntimeError("Multiple fits of the same name")
+            elif len(corro) == 1:
+                return corro[0].id
+            else:
             # create if not found
-            created = await self.create_correspondent(name, client=client)
-            if created:
-                # accept either 'id' or 'pk' in created object
-                id_val = created.get("id") or created.get("pk")
-                if id_val is not None:
-                    return int(id_val)
+                created = await self.create_correspondent(name, client=client)
+                if created:
+                    # accept either 'id' or 'pk' in created object
+                    id_val = created.get("id") or created.get("pk")
+                    if id_val is not None:
+                        return int(id_val)
         except Exception as e:
             logger.warning(f"get_or_create_correspondent failed for '{name}': {e}")
         return None
@@ -550,16 +553,19 @@ class PaperlessClient:
         if not name:
             return None
         try:
-            name_map = await self.tags_name_map(client=client)
-            target = name.strip().casefold()
-            for k, v in name_map.items():
-                if v and v.strip().casefold() == target:
-                    return k
-            created = await self.create_tag(name, client=client)
-            if created:
-                id_val = created.get("id") or created.get("pk")
-                if id_val is not None:
-                    return int(id_val)
+            name_map = await self.list_tags(client=client)
+            tag_object = list(filter(lambda x: x.name == name,name_map))
+            if len(tag_object) >1:
+                raise RuntimeError("Multiple fits of the same name")
+            elif len(tag_object) == 1:
+                return tag_object[0].id
+            else:
+           
+                created = await self.create_tag(name, client=client)
+                if created:
+                    id_val = created.get("id") or created.get("pk")
+                    if id_val is not None:
+                        return int(id_val)
         except Exception as e:
             logger.warning(f"get_or_create_tag failed for '{name}': {e}")
         return None
@@ -572,16 +578,19 @@ class PaperlessClient:
         if not name:
             return None
         try:
-            name_map = await self.document_types_name_map(client=client)
-            target = name.strip().casefold()
-            for k, v in name_map.items():
-                if v and v.strip().casefold() == target:
-                    return k
-            created = await self.create_document_type(name, client=client)
-            if created:
-                id_val = created.get("id") or created.get("pk")
-                if id_val is not None:
-                    return int(id_val)
+            # try to find existing correspondent by name (case-insensitive)
+            name_map = await self.list_document_types(client=client)
+            doc_type = list(filter(lambda x: x.name == name,name_map))
+            if len(doc_type) >1:
+                raise RuntimeError("Multiple fits of the same name")
+            elif len(doc_type) == 1:
+                return doc_type[0].id
+            else:
+                created = await self.create_document_type(name, client=client)
+                if created:
+                    id_val = created.get("id") or created.get("pk")
+                    if id_val is not None:
+                        return int(id_val)
         except Exception as e:
             logger.warning(f"get_or_create_document_type failed for '{name}': {e}")
         return None
@@ -646,6 +655,83 @@ class PaperlessClient:
             logger.exception(f"Failed to update document id={doc_id} from metadata: {e}")
             return {}
 
+
+    async def update_document_from_model(
+        self,
+        doc: Document,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> Dict[str, Any]:
+        """
+        Update a document using a Document model.
+
+        This method:
+          - requires the Document to have an `id`
+          - converts plaintext fields (correspondent, document_type, tags) into
+            Paperless numeric IDs, creating missing objects as needed
+          - calls `update_document` to PATCH the document and returns the updated object
+
+        Returns the updated document object on success, or an empty dict on failure/no-op.
+        """
+        if not doc or getattr(doc, "id", None) is None:
+            logger.warning(f"update_document_from_model called without a document id: {doc}")
+            return {}
+
+        try:
+            # Start from the model's API-ready dump (plaintext values)
+            payload: Dict[str, Any] = doc.model_dump_for_api()
+
+            # Correspondent -> id
+            if payload.get("correspondent"):
+                corr_name = payload.get("correspondent")
+                corr_id = await self.get_or_create_correspondent(corr_name, client=client)
+                if corr_id is not None:
+                    payload["correspondent"] = corr_id
+                else:
+                    # If resolution failed, remove the field to avoid sending invalid data
+                    payload.pop("correspondent", None)
+
+            # Document type -> id
+            if payload.get("document_type"):
+                dt_name = payload.get("document_type")
+                dt_id = await self.get_or_create_document_type(dt_name, client=client)
+                if dt_id is not None:
+                    payload["document_type"] = dt_id
+                else:
+                    payload.pop("document_type", None)
+
+            # Tags -> list of ids (resolve concurrently)
+            tag_names = payload.get("tags") or []
+            tag_ids: List[int] = []
+            if tag_names:
+                tasks = [self.get_or_create_tag(t, client=client) for t in tag_names if t]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for res in results:
+                    if isinstance(res, Exception):
+                        logger.warning(f"Error resolving tag id: {res}")
+                        continue
+                    if res is None:
+                        # unresolved tag; skip
+                        continue
+                    try:
+                        tag_ids.append(int(res))
+                    except Exception:
+                        # if it's not coercible to int, skip
+                        continue
+
+                if tag_ids:
+                    payload["tags"] = tag_ids
+                else:
+                    payload.pop("tags", None)
+
+            if not payload:
+                logger.info(f"No updatable fields found in document model id={doc.id}")
+                return {}
+
+            updated = await self.update_document(doc.id, payload, client=client)
+            return updated or {}
+        except Exception as e:
+            logger.exception(f"Failed to update document from model id={getattr(doc, 'id', None)}: {e}")
+            return {}
 
     async def update_document(
         self,
