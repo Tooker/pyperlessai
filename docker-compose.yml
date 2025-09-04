@@ -4,7 +4,7 @@ services:
   poc:
     build: .
     env_file:
-      - .env
+      - stack.env
     environment:
       - CRON_SCHEDULE=${CRON_SCHEDULE:-"*/15 * * * *"}
       - POC_LIMIT=${POC_LIMIT:-1}
