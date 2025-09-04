@@ -13,4 +13,5 @@ dependencies = [
     "ruff>=0.12.9",
     "pyyaml>=6.0.2",
     "openapi-python-client>=0.25.3",
+    "apscheduler>=3.11.0",
 ]

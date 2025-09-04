@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  poc:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - CRON_SCHEDULE=${CRON_SCHEDULE:-"*/15 * * * *"}
+      - POC_LIMIT=${POC_LIMIT:-1}
+      - RUN_ON_START=${RUN_ON_START:-true}
+    volumes:
+      - ./poc_output:/app/poc_output
+    restart: unless-stopped
